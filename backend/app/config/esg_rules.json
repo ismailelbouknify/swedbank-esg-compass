@@ -1,0 +1,185 @@
+{
+  "version": "1.0.0",
+  "methodology_reference": "ESG-76398 questionnaire (reporting / planning / execution / performance improvement ambition levels)",
+  "lookback_years": 3,
+
+  "dimensions": {
+    "reporting": {
+      "label": "Reporting",
+      "scope": "company",
+      "max_level": 6,
+      "question": "What is the customer's ambition level regarding reporting?",
+      "levels": {
+        "1": "There is no evidence of any sustainability reporting practices.",
+        "2": "The company reports performance on sustainability only to regulators to ensure compliance.",
+        "3": "The company reports performance on sustainability on a voluntary and/or ad hoc basis to stakeholders.",
+        "4": "The company reports performance on sustainability on a regular basis in a publicly available source.",
+        "5": "The company follows leading practices or sector standards of sustainability reporting (e.g. GRI, SASB, Integrated Reporting).",
+        "6": "The publicly available disclosures of the company are verified by an independent and qualified third party."
+      },
+      "query_terms": ["sustainability report", "sustainability reporting", "ESG report", "non-financial statement", "GRI", "GRI Standards", "SASB", "ESRS", "CSRD", "integrated reporting", "TCFD", "assurance", "limited assurance", "reasonable assurance", "independent assurance", "assurance report", "ISAE 3000", "AA1000", "auditor", "KPMG", "PwC", "EY", "Ernst & Young", "Deloitte", "BDO", "Grant Thornton", "annual report", "reporting period", "in accordance with", "with reference to"]
+    },
+    "planning": {
+      "label": "Planning",
+      "scope": "factor",
+      "max_level": 6,
+      "question": "What is the customer's ambition level regarding Planning?",
+      "levels": {
+        "1": "There is no evidence of any goals, strategy or plans related to the factor.",
+        "2": "There are informal goals, strategy and plans related to the factor.",
+        "3": "There are formalized qualitative goals, strategy and plans related to the factor.",
+        "4": "There are formalized qualitative goals, strategy and plans related to the factor that are also publicly available.",
+        "5": "There are formalized goals, strategy and plans related to the factor; the goals are quantitative and timed, with clear ownership in the company.",
+        "6": "The formalized goals, strategy and plans related to the factor are ambitious when compared to relevant benchmarks."
+      },
+      "query_terms": ["target", "targets", "goal", "goals", "aim", "aims", "ambition", "commitment", "commit", "strategy", "plan", "roadmap", "policy", "by 2025", "by 2030", "by 2035", "by 2040", "by 2050", "baseline", "reduce", "increase", "achieve", "science-based", "SBTi", "Paris Agreement", "net zero", "responsible", "accountable", "board"]
+    },
+    "execution": {
+      "label": "Execution",
+      "scope": "factor",
+      "max_level": 3,
+      "question": "What is the customer's ambition level regarding Execution?",
+      "levels": {
+        "1": "There is no evidence of any activities to manage the factor during any of the last three years.",
+        "2": "There is evidence of activities to manage the factor during any of the last three years.",
+        "3": "There is evidence of activities to execute strategy and plans to achieve the goals related to the factor during any of the last three years."
+      },
+      "query_terms": ["implemented", "installed", "introduced", "launched", "invested", "investment", "rolled out", "completed", "conducted", "programme", "program", "initiative", "project", "training", "audit", "upgraded", "replaced", "certified", "during the year", "in 2023", "in 2024", "in 2025", "to achieve", "towards our target", "in line with our strategy"]
+    },
+    "performance": {
+      "label": "Performance Improvement",
+      "scope": "factor",
+      "max_level": 3,
+      "question": "What is the customer's ambition level regarding Performance Improvement?",
+      "levels": {
+        "1": "There is no evidence of any improvement in performance on the factor.",
+        "2": "There is evidence that the company has improved its performance on the factor over the last three years.",
+        "3": "There is evidence that the company has a sector leading performance on the factor."
+      },
+      "query_terms": ["decreased", "reduced", "increased", "improved", "compared to", "compared with", "from", "to", "per cent", "%", "year-on-year", "2022", "2023", "2024", "2025", "intensity", "per unit", "rate", "share", "KPI", "performance", "sector average", "industry average", "benchmark"]
+    }
+  },
+
+  "factors": [
+    {
+      "key": "energy_management",
+      "label": "Energy Management",
+      "pillar": "E",
+      "keywords": ["energy", "energy consumption", "energy efficiency", "energy use", "renewable energy", "renewable electricity", "electricity", "MWh", "GWh", "kWh", "energy intensity", "heating", "fuel", "solar", "LED", "energy audit", "ISO 50001"],
+      "metrics": [
+        {"name": "energy intensity", "keywords": ["energy intensity", "kwh/unit", "kwh per unit", "kwh/m2", "kwh per", "mwh per", "energy per"], "better": "lower"},
+        {"name": "energy consumption", "keywords": ["energy consumption", "energy use", "total energy", "electricity consumption", "mwh", "gwh"], "better": "lower"},
+        {"name": "renewable energy share", "keywords": ["share of renewable", "renewable share", "renewable energy share", "renewable electricity share", "renewable electricity", "% renewable", "renewable energy"], "better": "higher"}
+      ]
+    },
+    {
+      "key": "product_lifecycle",
+      "label": "Product Design & Lifecycle Management",
+      "short_label": "Product Lifecycle",
+      "pillar": "E",
+      "keywords": ["product design", "lifecycle", "life cycle", "life-cycle assessment", "LCA", "circular", "circularity", "circular economy", "recycled", "recycling", "recyclable", "reuse", "repair", "packaging", "eco-design", "ecodesign", "take-back", "waste", "durability", "materials"],
+      "metrics": [
+        {"name": "recycled content", "keywords": ["recycled content", "recycled material", "recycled materials", "secondary material"], "better": "higher"},
+        {"name": "recyclable products", "keywords": ["recyclable", "recyclability", "circular design", "eco-designed"], "better": "higher"},
+        {"name": "waste to landfill", "keywords": ["landfill", "waste generated", "waste"], "better": "lower"},
+        {"name": "packaging material", "keywords": ["packaging"], "better": "lower"}
+      ]
+    },
+    {
+      "key": "data_security",
+      "label": "Data Security",
+      "pillar": "S",
+      "keywords": ["data security", "information security", "cybersecurity", "cyber security", "data protection", "privacy", "GDPR", "ISO 27001", "ISO/IEC 27001", "data breach", "breaches", "security incident", "phishing", "penetration test", "SOC 2", "encryption", "personal data"],
+      "metrics": [
+        {"name": "data breaches / security incidents", "keywords": ["data breach", "breaches", "security incident", "security incidents", "cyber incident", "cyber incidents", "cyber-attack"], "better": "lower"},
+        {"name": "security training coverage", "keywords": ["security training", "security awareness", "phishing training", "phishing simulation"], "better": "higher"},
+        {"name": "ISO 27001 certification coverage", "keywords": ["27001"], "better": "higher"}
+      ]
+    },
+    {
+      "key": "labor_practices",
+      "label": "Labor Practices",
+      "pillar": "S",
+      "keywords": ["labor", "labour", "working conditions", "fair wages", "living wage", "wage", "collective bargaining", "collective agreement", "trade union", "freedom of association", "working hours", "employee turnover", "labour rights", "labor rights", "employment", "overtime", "ILO", "contract workers"],
+      "metrics": [
+        {"name": "employee turnover", "keywords": ["turnover", "attrition"], "better": "lower"},
+        {"name": "collective agreement coverage", "keywords": ["collective agreement", "collective bargaining"], "better": "higher"},
+        {"name": "living wage coverage", "keywords": ["living wage", "fair wage"], "better": "higher"},
+        {"name": "training hours", "keywords": ["training hours", "hours of training"], "better": "higher"}
+      ]
+    },
+    {
+      "key": "diversity_inclusion",
+      "label": "Employee Engagement, Diversity & Inclusion",
+      "short_label": "Diversity & Inclusion",
+      "pillar": "S",
+      "keywords": ["diversity", "inclusion", "equal opportunity", "gender", "women", "female", "women in management", "gender balance", "gender pay gap", "pay equity", "employee engagement", "engagement survey", "engagement score", "inclusive", "discrimination", "under-represented"],
+      "metrics": [
+        {"name": "women in management", "keywords": ["women in management", "female managers", "women in leadership", "women in senior", "female leaders", "management positions"], "better": "higher"},
+        {"name": "women in workforce", "keywords": ["women", "female"], "better": "higher"},
+        {"name": "gender pay gap", "keywords": ["pay gap"], "better": "lower"},
+        {"name": "employee engagement score", "keywords": ["engagement score", "engagement index", "engagement"], "better": "higher"}
+      ]
+    }
+  ],
+
+  "reporting_rules": {
+    "frameworks": {
+      "GRI": ["\\bGRI\\b", "Global Reporting Initiative"],
+      "SASB": ["\\bSASB\\b", "Sustainability Accounting Standards Board"],
+      "ESRS": ["\\bESRS\\b", "European Sustainability Reporting Standards"],
+      "Integrated Reporting": ["Integrated Reporting", "<IR>", "\\bIIRC\\b", "International Integrated Reporting"],
+      "TCFD": ["\\bTCFD\\b", "Task Force on Climate-related Financial Disclosures"],
+      "ISSB / IFRS S1-S2": ["\\bISSB\\b", "IFRS S1", "IFRS S2"],
+      "CDP": ["\\bCDP\\b"]
+    },
+    "level5_frameworks": ["GRI", "SASB", "ESRS", "Integrated Reporting", "ISSB / IFRS S1-S2"],
+    "framework_adherence_patterns": ["in accordance with", "with reference to", "prepared according to", "prepared in line with", "prepared in accordance", "follows the", "complies with", "reported according to", "content index", "index"],
+    "regulation_terms": ["CSRD", "Corporate Sustainability Reporting Directive", "NFRD", "Non-Financial Reporting Directive", "2014/95/EU", "non-financial statement", "statutory sustainability report", "Annual Accounts Act", "Årsredovisningslag"],
+    "assurance_patterns": ["limited assurance", "reasonable assurance", "independent assurance", "assurance report", "assurance statement", "ISAE 3000", "ISAE3000", "AA1000", "third-party verification", "externally verified", "externally assured", "independent auditor's report on the sustainability", "auditor's limited assurance"],
+    "assurance_providers": ["KPMG", "PwC", "PricewaterhouseCoopers", "EY", "Ernst & Young", "Deloitte", "BDO", "Grant Thornton", "Bureau Veritas", "DNV", "SGS", "Mazars", "Forvis Mazars", "LRQA", "TÜV"],
+    "report_title_patterns": ["sustainability report", "esg report", "corporate responsibility report", "csr report", "responsibility report", "impact report", "annual and sustainability report", "integrated report", "annual report", "sustainability statement"]
+  },
+
+  "planning_rules": {
+    "require_clear_ownership_for_level_5": false,
+    "benchmark_terms": {
+      "science_based": ["science-based", "science based", "SBTi", "1.5°C", "1.5 °C", "1.5C", "well below 2"],
+      "paris_agreement": ["Paris Agreement", "Paris-aligned", "Paris aligned"],
+      "eu_taxonomy": ["EU Taxonomy", "taxonomy-aligned", "taxonomy aligned"],
+      "peers": ["peers", "peer group", "sector average", "industry average", "above the average", "below the average", "industry benchmark", "compared to the sector", "compared with the sector"],
+      "national_international_targets": ["national target", "national goal", "EU target", "Fit for 55", "Green Deal", "UN SDG"],
+      "best_available_technology": ["best available technology", "best available technologies", "BAT"],
+      "historical_performance": ["historical performance", "compared with the previous", "exceeds our previous", "twice the rate", "faster than"]
+    },
+    "ownership_terms": ["responsible for", "accountable", "owned by", "ownership", "Board of Directors", "board oversees", "executive committee", "CEO", "CFO", "COO", "Chief", "Head of", "steering committee", "sustainability committee", "linked to remuneration", "KPI owner"]
+  },
+
+  "execution_rules": {
+    "goal_link_terms": ["to achieve", "to reach", "towards our", "toward our", "in line with our", "as part of our", "to meet our", "in support of our", "contributing to our", "target", "goal", "strategy", "roadmap", "plan"]
+  },
+
+  "performance_rules": {
+    "min_data_points": 2,
+    "sector_leading_terms": ["sector average", "industry average", "sector median", "industry median", "better than the average", "industry-leading", "sector-leading", "sector leading", "industry leading", "top quartile", "best in class", "best-in-class", "EU Taxonomy", "science-based target trajectory", "SBTi trajectory", "national average", "sector benchmark", "industry benchmark"],
+    "vague_improvement_terms": ["significantly improved", "improved", "substantial progress", "made progress", "strong progress", "better"]
+  },
+
+  "source_priorities": {
+    "uploaded_report": {"priority": 1, "quality": 1.0, "label": "Uploaded company document"},
+    "sustainability_report": {"priority": 2, "quality": 0.95, "label": "Official sustainability report"},
+    "annual_report": {"priority": 3, "quality": 0.9, "label": "Official annual report"},
+    "company_website": {"priority": 4, "quality": 0.8, "label": "Official company website"},
+    "regulatory_source": {"priority": 5, "quality": 0.75, "label": "Regulatory / standards source"},
+    "external_source": {"priority": 6, "quality": 0.55, "label": "Credible external source"},
+    "other_web": {"priority": 7, "quality": 0.4, "label": "Other public web page"}
+  },
+
+  "confidence": {
+    "weights": {"source_quality": 0.3, "supporting_sources": 0.15, "extraction_certainty": 0.25, "rule_completeness": 0.3},
+    "conflict_penalty": 0.25,
+    "unverified_penalty": 0.15,
+    "heuristic_extraction_certainty": 0.55,
+    "thresholds": {"high": 0.75, "medium": 0.5}
+  }
+}

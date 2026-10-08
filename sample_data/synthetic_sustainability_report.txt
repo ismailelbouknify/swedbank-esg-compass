@@ -1,0 +1,41 @@
+Nordvik Components AB Sustainability Report 2025
+SYNTHETIC TEST DOCUMENT. Nordvik Components AB is a fictional company created to demonstrate this software. None of the figures below describe a real organisation.
+About this report
+This sustainability report covers the reporting period 1 January to 31 December 2025. We publish a sustainability report every year together with our annual report.
+This report has been prepared in accordance with the GRI Standards 2021. A GRI content index is included on page 5.
+Our sustainability strategy is approved by the Board of Directors and is reviewed annually by the Executive Committee.
+---PAGE---
+Energy Management
+Energy use in our machining plants is our most material environmental impact.
+We aim to reduce energy consumption per unit produced by 30% by 2030 compared with a 2020 baseline.
+The energy target is owned by our Chief Operating Officer and progress is reviewed quarterly by the Executive Committee.
+In 2024 we installed 1.2 MW of rooftop solar panels at our Boras plant and replaced legacy air compressors to achieve our energy target.
+In 2025 we completed energy audits at all three production sites as part of our energy efficiency roadmap.
+Energy performance
+Indicator 2023 2024 2025
+Energy intensity (kWh/unit) 124 116 108
+Renewable electricity share (%) 41 55 63
+Energy intensity decreased by 12.9% compared with 2023.
+---PAGE---
+Employee Engagement, Diversity and Inclusion
+Our goal is to reach 40% women in management positions by 2027.
+In 2025 we launched a mentoring programme for female engineers and organised university recruitment events in line with our diversity strategy.
+Women in management: 2023: 28% | 2024: 31% | 2025: 34%
+Our annual employee engagement survey had a response rate of 86% in 2025.
+Labour Practices
+Our Labour Rights Policy commits us to fair wages, safe working hours and freedom of association at all sites.
+In 2024 we conducted labour rights audits at 12 supplier sites.
+Working conditions for our employees significantly improved during the year.
+---PAGE---
+Data Security
+We maintain an information security policy approved by the Board of Directors, which sets out our approach to data protection and cybersecurity.
+In 2025 we completed ISO 27001 certification of the information security management system at our headquarters.
+Product Design and Lifecycle Management
+Our strategy is to become a circular business by designing products for durability, repair and recycling.
+---PAGE---
+Independent assurance
+KPMG AB has performed a limited assurance engagement on selected sustainability information in this report in accordance with ISAE 3000.
+The assurance report covers the GRI disclosures on energy, diversity and labour practices.
+GRI content index
+GRI 302-1 Energy consumption within the organization: page 2
+GRI 405-1 Diversity of governance bodies and employees: page 3

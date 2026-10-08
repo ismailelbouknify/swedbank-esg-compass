@@ -1,0 +1,30 @@
+# Python environment
+backend/.venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local LLM
+models/*.gguf
+
+# Environment/secrets
+.env
+backend/.env
+frontend/.env
+
+# Node dependencies
+frontend/node_modules/
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

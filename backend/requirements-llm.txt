@@ -1,0 +1,5 @@
+# Optional: in-process local inference with a GGUF model (CPU).
+# On Windows/macOS without a C++ toolchain, use the prebuilt CPU wheels:
+#   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+# Alternatively skip this file entirely and use Ollama (LLM_PROVIDER=ollama).
+llama-cpp-python>=0.2.90

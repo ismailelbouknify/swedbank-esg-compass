@@ -1,0 +1,26 @@
+# Core API
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+pydantic-settings>=2.2
+python-multipart>=0.0.9
+SQLAlchemy>=2.0
+
+# Documents
+PyMuPDF>=1.24
+pdfplumber>=0.11
+
+# Web discovery / extraction
+httpx>=0.27
+beautifulsoup4>=4.12
+trafilatura>=1.8
+ddgs>=9.0
+
+# Retrieval
+rank-bm25>=0.2.2
+
+# Export
+openpyxl>=3.1
+
+# Tests
+pytest>=8.0
