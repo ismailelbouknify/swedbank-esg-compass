@@ -44,8 +44,12 @@ def extract_html(html: str | bytes, base_url: str) -> HtmlContent:
 
     links: list[tuple[str, str]] = []
     for a in soup.find_all("a", href=True):
-        href = urljoin(base_url, a["href"]).split("#")[0]
-        if urlparse(href).scheme in ("http", "https"):
+        try:
+            href = urljoin(base_url, a["href"]).split("#")[0]
+            scheme = urlparse(href).scheme
+        except ValueError:  # a malformed link in untrusted HTML must not stop the page
+            continue
+        if scheme in ("http", "https"):
             links.append((href, a.get_text(" ", strip=True)[:200]))
     return HtmlContent(title=title, text=text, links=links)
 

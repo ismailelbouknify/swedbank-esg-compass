@@ -17,7 +17,7 @@ def public_error(error: str | None) -> str | None:
     if not error:
         return None
     # exception text ("ValueError: ...") is internal; plain messages (e.g. server restart) are shown as-is
-    if re.match(r"^\w*(?:Error|Exception)", error) or is_technical(error):
+    if re.match(r"^(?:\[runner crash\]|\w*(?:Error|Exception)\b)", error) or is_technical(error):
         return "The analysis could not be completed. Try again, or upload the sustainability report as a PDF."
     return error
 
@@ -40,7 +40,7 @@ def review_counts(db: Session, assessment_ids: list[int]) -> dict[int, tuple[int
         c = counts[aid]
         c[1] += 1
         c[0] += rs in ("APPROVED", "OVERRIDDEN")
-        c[2] += es == "NO_EVIDENCE_FOUND"
+        c[2] += es in ("NO_EVIDENCE_FOUND", "INSUFFICIENT_SOURCE_COVERAGE")
     return {k: (v[0], v[1], v[2]) for k, v in counts.items()}
 
 
@@ -88,8 +88,11 @@ def recommendation_fields(r: Recommendation, comment: str | None = None) -> dict
     return {
         **{c: getattr(r, c) for c in (
             "id", "assessment_id", "factor", "dimension", "recommended_level", "max_level", "evidence_status",
-            "reason", "conditions", "next_level_missing", "evidence_ids", "confidence_label", "review_status",
+            "reason", "conditions", "next_level_missing", "evidence_ids", "confidence_label", "review_status", "coverage_state",
             "final_level", "updated_at")},
+        # Preserved AI rationale — survives analyst overrides.
+        "ai_recommended_level": r.recommended_level,
+        "ai_reason": r.ai_reason or r.reason,
         "notes": analyst_notes(r.notes),
         "review_state": review_state(r.review_status, r.evidence_status),
         "analyst_comment": comment,

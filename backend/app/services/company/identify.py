@@ -36,6 +36,31 @@ def looks_official(url: str, company_name: str, official_domain: str | None) -> 
     return dom == joined or dom in joined or any(t == dom or (len(t) >= 4 and t in dom) for t in tokens)
 
 
+# Signals that a page on an official domain is NOT a company ESG disclosure.
+# These patterns suggest marketplace, developer portal, product listings, etc.
+_NON_DISCLOSURE_PATH_HINTS = (
+    "/marketplace/", "/store/", "/shop/", "/product/", "/products/",
+    "/developers/", "/developer/", "/api/", "/docs/api",
+    "/for-sale/", "/listing/", "/listings/",
+    "/job/", "/jobs/", "/careers/open-positions/",
+)
+_NON_DISCLOSURE_HAY_HINTS = (
+    "developer portal", "api documentation", "marketplace",
+    "product listing", "for sale", "buy now", "add to cart",
+)
+
+
+def _is_non_disclosure_page(path: str, hay: str) -> bool:
+    """True when an official-domain URL is probably not a company ESG disclosure."""
+    for hint in _NON_DISCLOSURE_PATH_HINTS:
+        if hint in path:
+            return True
+    for hint in _NON_DISCLOSURE_HAY_HINTS:
+        if hint in hay:
+            return True
+    return False
+
+
 def classify_source(url: str, title: str, snippet: str, company_name: str, official_domain: str | None) -> tuple[str, bool]:
     """Return (source_type, is_official)."""
     host = (urlparse(url).hostname or "").lower()
@@ -44,12 +69,23 @@ def classify_source(url: str, title: str, snippet: str, company_name: str, offic
     official = looks_official(url, company_name, official_domain)
     if official:
         is_pdf = path.endswith(".pdf")
-        if any(k in hay for k in ("sustainability report", "esg report", "sustainability-report", "responsibility report", "impact report", "csr report")):
+        # Detect pages that are on an official domain but are not company ESG disclosures.
+        if _is_non_disclosure_page(path, hay):
+            return "other_web", False
+        if any(k in hay for k in ("sustainability report", "esg report", "sustainability-report",
+                                   "responsibility report", "impact report", "csr report",
+                                   "sustainability statement", "climate report", "environmental report")):
             return "sustainability_report", True
         if "annual report" in hay or "annual-report" in hay or "annualreport" in hay:
             return "annual_report", True
-        if is_pdf and ("sustainab" in hay or "esg" in hay):
+        if is_pdf and ("sustainab" in hay or "esg" in hay or "responsibility" in hay):
             return "sustainability_report", True
+        if is_pdf and ("annual" in hay or "report" in hay):
+            return "annual_report", True
+        if any(k in path for k in ("/investor", "/ir/", "investor-relations")):
+            return "investor_relations", True
+        if any(k in path for k in ("/polic", "/governance", "code-of-conduct")):
+            return "policy_page", True
         return "company_website", True
     if any(h in host for h in REGULATORY_HOST_HINTS):
         return "regulatory_source", False
@@ -61,7 +97,7 @@ def classify_source(url: str, title: str, snippet: str, company_name: str, offic
 def rank_search_result(url: str, title: str, snippet: str, company_name: str, official_domain: str | None, year: int) -> float:
     """Higher is better. Used to choose a controlled number of pages to download."""
     source_type, official = classify_source(url, title, snippet, company_name, official_domain)
-    score = 10 - source_priority(source_type)["priority"]
+    score = 12 - source_priority(source_type)["priority"]
     hay = f"{title} {snippet} {url}".lower()
     if url.lower().split("?")[0].endswith(".pdf"):
         score += 2

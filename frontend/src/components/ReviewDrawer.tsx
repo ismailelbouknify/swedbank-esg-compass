@@ -102,7 +102,8 @@ export default function ReviewDrawer({ recId, onClose, onChanged, onNext }: {
     }
   }
 
-  const noEvidence = rec?.evidence_status === "NO_EVIDENCE_FOUND";
+  const insufficient = rec?.evidence_status === "INSUFFICIENT_SOURCE_COVERAGE";
+  const noEvidence = rec?.evidence_status === "NO_EVIDENCE_FOUND" || insufficient;
   const [primary, ...others] = rec?.evidence ?? [];
   const changed = rec && rec.final_level !== null && rec.final_level !== rec.recommended_level;
   const title = rec ? (rec.factor === "reporting" ? "Reporting" : rec.factor_label) : "Loading…";
@@ -125,7 +126,7 @@ export default function ReviewDrawer({ recId, onClose, onChanged, onNext }: {
           <div className="drawer-body">
             <div className="drawer-score">
               {noEvidence && !changed ? (
-                <div className="score-line"><span className="score-big">—</span> <span className="muted">No evidence found in reviewed sources</span></div>
+                <div className="score-line"><span className="score-big">—</span> <span className="muted">{insufficient ? "Insufficient source coverage" : "No evidence found in reviewed sources"}</span></div>
               ) : (
                 <div className="score-line">
                   <span className="muted">{changed ? "Recommended" : "Recommended:"}</span>{" "}

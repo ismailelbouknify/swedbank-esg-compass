@@ -190,6 +190,10 @@ class EvidenceAuditOut(ORM):
     llm_confidence: float | None
     verification_status: str
     verification_notes: list[str]
+    evidence_lifecycle: str | None = None
+    rejection_codes: list[str] = []
+    evidence_origin: str | None = None
+    llm_quote_failed: bool | None = False
     created_at: UTCDateTime
 
 
@@ -205,6 +209,7 @@ class DecisionOut(ORM):
 
 
 class RecommendationOut(ORM):
+    coverage_state: str | None = None
     id: int
     assessment_id: int
     factor: str
@@ -216,6 +221,9 @@ class RecommendationOut(ORM):
     level_description: str
     evidence_status: str
     reason: str
+    # Preserved AI rationale — survives analyst overrides without being overwritten.
+    ai_recommended_level: int | None = None
+    ai_reason: str | None = None
     conditions: dict[str, Any]
     next_level_missing: list[str]
     notes: list[str]

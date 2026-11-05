@@ -14,7 +14,8 @@ class Base(DeclarativeBase):
 
 
 def _make_engine(url: str):
-    kwargs = {}
+    # hide_parameters: database errors must not carry report text into logs or error records
+    kwargs = {"hide_parameters": True}
     if url.startswith("sqlite"):
         # the analysis runs in a background thread while the UI polls status
         kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
@@ -59,6 +60,28 @@ _ADDED_COLUMNS = {
         "supersedes_id": "INTEGER",
         "superseded_by_id": "INTEGER",
         "duration_seconds": "FLOAT",
+        "company_identity": "JSON",
+        "coverage_metrics": "JSON",
+    },
+    "evidence": {
+        # Added in evidence-quality redesign; nullable so existing rows keep NULL (treated as
+        # "candidate" by the scoring layer via the verification_status fallback).
+        "evidence_lifecycle": "VARCHAR(20)",
+        "rejection_codes": "TEXT",  # JSON array; NULL treated as [] by the ORM default
+        "evidence_origin": "VARCHAR(40)",
+        "llm_quote_failed": "BOOLEAN DEFAULT 0",
+    },
+    "sources": {
+        "fetch_outcome": "VARCHAR(40)",
+        "content_sha256": "VARCHAR(64)",
+        "bytes_downloaded": "INTEGER",
+        "company_match": "VARCHAR(30)",
+        "rejection_reason": "VARCHAR(60)",
+    },
+    "recommendations": {
+        # Preserved AI rationale so analyst overrides don't overwrite the model's explanation.
+        "ai_reason": "TEXT",
+        "coverage_state": "VARCHAR(30)",
     },
 }
 

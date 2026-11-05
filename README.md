@@ -143,14 +143,18 @@ Development (two terminals):
 # terminal 1
 cd backend
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-uvicorn app.main:app --reload      # http://localhost:8000  (API docs: /docs)
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000   # http://127.0.0.1:8000
 
 # terminal 2
 cd frontend
 npm run dev                        # http://localhost:5173  (proxies /api to :8000)
 ```
 
-Single process: `cd frontend && npm run build`, then run only uvicorn and open http://localhost:8000.
+Single process: `cd frontend && npm run build`, then run only uvicorn and open http://127.0.0.1:8000.
+
+Bind to `127.0.0.1` as above rather than `0.0.0.0` unless network access is intentionally required. The application has no
+authentication, so anyone who can reach the port can use it. The interactive API docs (`/docs`) load scripts from a public
+CDN and are only available with `BANK_SAFE_MODE=false`.
 
 Pages: `/` new assessment · `/assessments` saved assessments · `/assessments/{id}` result (tabs: Assessment,
 Sources, Audit) · `/assessments/{id}/progress` running analysis with timer · `/assessments/{id}/report` print/PDF
@@ -214,15 +218,80 @@ runs (fallback and mocked-LLM), exports.
 ## 11. Privacy / local-AI design
 
 - No cloud LLM integration exists in the code. Inference runs in-process (llama.cpp) or via a local Ollama server.
-- Uploaded documents stay in `backend/data/`. The only outbound traffic is web search and downloads of public pages,
-  which you can disable per assessment (checkbox) or globally (`SEARCH_PROVIDER=none`).
+- Uploaded documents stay in `backend/data/`. The only outbound traffic is web search and retrieval of public pages,
+  which you can disable per assessment (checkbox) or for the installation (see below).
+- Search providers receive the company name and search terms, never document content.
 - Only short passages are sent to the model; every model output is stored with the model name for audit.
 
-Security measures: PDF-only uploads (extension, content type, `%PDF` magic bytes, size limit), uploads stored under
-generated names (user filenames never touch the filesystem), stored files served only from inside the data directory,
-URL validation (http/https only, no credentials, standard ports, private/loopback/link-local addresses rejected,
-every redirect re-validated), download timeouts, size limits and content-type checks, a controlled number of pages.
-Downloaded content is only parsed, never executed.
+### Source coverage
+
+Each answer has one of three coverage states: `EVIDENCE_FOUND`, `NO_EVIDENCE_FOUND` (enough valid company sources were reviewed and
+nothing relevant was accepted) or `INSUFFICIENT_SOURCE_COVERAGE` (too few reliable sources to conclude anything; no level is recorded,
+and the analyst is asked to upload a report). Coverage counts sources that pass the company identity gate: one report document, or
+`COVERAGE_MIN_VALID_SOURCES` official sources that are about sustainability. Third-party pages never make coverage sufficient. When coverage is thin, one bounded recovery search runs (`RECOVERY_*` settings). Its sources pass
+through the same gates. Search queries contain the company name and search terms only. `recovery_search_enabled=false` turns it off.
+
+### Security configuration
+
+`BANK_SAFE_MODE=true` (the default) is a restricted security mode: a security-hardened configuration intended to support
+controlled environments. **It reduces technical risk but does not replace organisational security approval or the malware
+scanning required by the deployment environment.** Final deployment remains subject to organisational IT/security review.
+All settings are listed in `backend/.env.example`; the controls live in `backend/app/services/security/`.
+
+External content is always untrusted and is only ever parsed for text, never opened, rendered or executed:
+
+```
+Search (if enabled) -> URL + DNS/IP validation -> domain allowlist -> bounded HTTPS request -> validate every redirect
+  -> content type + size checks
+       HTML: extract text
+       PDF:  %PDF- signature -> malware scan hook -> in-memory text extraction -> discard the PDF
+  -> company/source validation -> retrieval -> evidence validation -> local LLM -> deterministic scoring
+```
+
+| Control | Behaviour | Settings |
+| --- | --- | --- |
+| Manual upload only | No search and no retrieval requests are made; analyses use uploaded PDFs | `ENABLE_WEB_SEARCH=false`, `ENABLE_EXTERNAL_FETCH=false` |
+| URL policy | HTTPS only; no credentials, non-standard ports, local names or numeric host tricks | `ALLOW_HTTP` |
+| Network targets | Every address a host resolves to must be public (private, loopback, link-local, metadata, multicast and reserved ranges are refused, for IPv4, IPv6 and IPv4 embedded in IPv6). The connection is pinned to the validated address | |
+| Domain allowlist | Optional; applies to every redirect hop too | `ALLOWED_EXTERNAL_DOMAINS`, `ALLOWED_DOMAINS_INCLUDE_SUBDOMAINS` |
+| Redirects | Followed one at a time, each validated like a new URL | `MAX_REDIRECTS` |
+| Size and pages | Limit checked from `Content-Length` and again while streaming. Over-limit PDFs are rejected, not truncated; such a report can be reviewed, then uploaded manually if it fits the upload limits | `MAX_DOWNLOAD_MB`, `MAX_HTML_SIZE_MB`, `MAX_PDF_PAGES`, `MAX_PDF_SIZE_MB` (uploads) |
+| Time | Connect and read timeouts, a total limit per source, bounded retries with backoff | `HTTP_CONNECT_TIMEOUT_SECONDS`, `HTTP_READ_TIMEOUT_SECONDS`, `MAX_SOURCE_PROCESSING_SECONDS`, `MAX_HTTP_RETRIES` |
+| External PDFs | Held in memory only, released after text extraction, never written to disk or to the database. Only metadata and extracted text are kept. Storing them needs `BANK_SAFE_MODE=false` and `STORE_DOWNLOADED_FILES=true` | `STORE_DOWNLOADED_FILES` |
+| Uploads | PDF only: extension, content type, signature, size, page count, encryption. Stored under generated names | `MAX_PDF_SIZE_MB`, `MAX_PDF_PAGES` |
+| Local LLM | All retrieval, extraction, validation and scoring run locally. No cloud LLM exists in the code, and a non-local Ollama endpoint is refused in this mode | `LLM_PROVIDER`, `OLLAMA_BASE_URL` |
+| Web server | Answers only the configured Host names, sends security headers, no CDN-backed API docs | `ALLOWED_HOSTS` |
+
+A rejected or unavailable source never stops an assessment. It is recorded (`sources.status`, `sources.fetch_outcome`, audit
+events such as `private_ip_rejected`, `redirect_rejected`, `download_size_limit_exceeded`, `invalid_pdf_signature`) and the
+analyst sees only "Source could not be processed", plus a notice that a gap may reflect an unavailable source rather than
+missing company activity. Logs hold hostnames, codes, durations and sizes, not document text or prompts.
+
+**Malware scanning.** No scanner is included, and PyMuPDF parsing is not a replacement for one. Register an
+organisation-approved scanner with `app.services.security.content_validator.set_content_scanner()`; content must then pass
+before it is parsed. `MALWARE_SCAN_REQUIRED=true` rejects all content until a scanner is registered. SHA-256 hashes are kept
+for duplicate detection and audit and say nothing about whether a file is safe.
+
+**Browser automation.** This version contains no browser fetcher, and `ENABLE_PLAYWRIGHT` (default `false`) only records
+permission through `browser_automation_allowed()`. Any future fallback must require that flag and: validate the initial URL
+and every navigation with `validate_external_url`, block `file://` and downloads, set strict navigation timeouts and a
+redirect limit, block images, media and fonts, use a fresh context without stored profiles or cookies, and always close the
+page, context and browser.
+
+**Outbound proxies.** Requests connect directly and ignore proxy environment variables, so traffic cannot be rerouted silently.
+An installation that must use an outbound or TLS-inspecting proxy needs integration work, or can run in manual-upload-only mode.
+
+### Dependency checks
+
+`backend/requirements.lock` records the exact versions last tested; install them with
+`pip install -r requirements.txt -c requirements.lock`, and regenerate it with `pip freeze` after a deliberate upgrade. The frontend
+is locked by `frontend/package-lock.json` (`npm ci`). To check for known vulnerabilities, which does not prove that a package
+is secure:
+
+```bash
+cd backend && python -m pip install pip-audit && python -m pip_audit -r requirements.lock
+cd frontend && npm audit
+```
 
 ## 12. Adding a new ESG factor
 

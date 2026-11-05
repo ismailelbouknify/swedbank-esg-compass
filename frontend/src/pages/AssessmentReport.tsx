@@ -10,7 +10,7 @@ const DIMS = ["planning", "execution", "performance"] as const;
 function levelText(r: RecommendationDetail | undefined): string {
   if (!r) return "—";
   const changed = r.final_level !== null && r.final_level !== r.recommended_level;
-  if (r.evidence_status === "NO_EVIDENCE_FOUND" && !changed) return "—";
+  if ((r.evidence_status === "NO_EVIDENCE_FOUND" || r.evidence_status === "INSUFFICIENT_SOURCE_COVERAGE") && !changed) return "—";
   return `${r.final_level ?? r.recommended_level} / ${r.max_level}`;
 }
 
@@ -48,7 +48,7 @@ export default function AssessmentReport() {
   const byKey = new Map(details.map((r) => [`${r.factor}:${r.dimension}`, r]));
   const reporting = byKey.get("reporting:reporting");
   const withEvidence = details.filter((r) => r.evidence.length > 0);
-  const gaps = details.filter((r) => r.evidence_status === "NO_EVIDENCE_FOUND");
+  const gaps = details.filter((r) => r.evidence_status === "NO_EVIDENCE_FOUND" || r.evidence_status === "INSUFFICIENT_SOURCE_COVERAGE");
   const decisions = details.flatMap((r) => r.decisions.map((d) => ({ r, d }))).sort((x, y) => x.d.id - y.d.id);
   const processed = sources.filter((s) => s.status === "PROCESSED");
 
@@ -110,7 +110,7 @@ export default function AssessmentReport() {
                   return (
                     <td key={d}>
                       {levelText(r)}
-                      {r && <span className="report-state">{r.review_state === "no_evidence" ? "No evidence" : `${STATE[r.review_state].icon} ${STATE[r.review_state].label}`}</span>}
+                      {r && <span className="report-state">{r.evidence_status === "INSUFFICIENT_SOURCE_COVERAGE" ? "Insufficient source coverage" : r.review_state === "no_evidence" ? "No evidence" : `${STATE[r.review_state].icon} ${STATE[r.review_state].label}`}</span>}
                     </td>
                   );
                 })}

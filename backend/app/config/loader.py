@@ -10,6 +10,8 @@ RULES_PATH = Path(__file__).with_name("esg_rules.json")
 
 FACTOR_DIMENSIONS = ("planning", "execution", "performance")
 REPORTING_FACTOR = "reporting"
+REPORT_SOURCE_TYPES = ("uploaded_report", "sustainability_report", "annual_report")
+OFFICIAL_SOURCE_TYPES = (*REPORT_SOURCE_TYPES, "company_website", "investor_relations", "policy_page")
 
 
 @lru_cache

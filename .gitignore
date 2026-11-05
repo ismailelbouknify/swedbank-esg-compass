@@ -28,3 +28,26 @@ frontend/node_modules/
 Thumbs.db
 .vscode/
 .idea/
+
+# Local database journals (may hold assessment data)
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+
+# Fetched and uploaded documents
+backend/data/
+
+# Logs
+*.log
+
+# Local models and caches (the README stays)
+*.gguf
+models/*
+!models/README.md
+
+# Other environments and build caches
+.env.*
+!.env.example
+node_modules/
+*.tsbuildinfo

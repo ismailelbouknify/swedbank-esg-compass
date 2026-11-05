@@ -48,7 +48,9 @@ class BM25Index:
         ranked = sorted(range(len(self.items)), key=lambda i: scores[i], reverse=True)
         out: list[RetrievedChunk] = []
         for i in ranked:
-            if scores[i] <= 0:
+            # In a small corpus a term found in many chunks scores zero or below. With a required
+            # term the chunk is still relevant; it just ranks after the positively scored ones.
+            if scores[i] <= 0 and not must:
                 break
             text = self.items[i]["text"]
             if must and not contains_any(text, must):

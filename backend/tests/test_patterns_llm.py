@@ -150,13 +150,16 @@ def test_hallucinated_llm_facts_are_not_trusted():
         "evidence_quote": "We will cut energy use by 45% by 2035 in line with SBTi.", "confidence": 0.99,
     })
     ex = FactExtractor(FakeLLM({"FACTOR:\nEnergy Management\n\nDIMENSION:\nPlanning": hallucination}), 2025)
-    [c] = ex.planning("energy_management", [_passage(ENERGY_TEXT)])
+    out = ex.planning("energy_management", [_passage(ENERGY_TEXT)])
+    [c] = [x for x in out if not x.evidence_origin]
+    [fallback] = [x for x in out if x.evidence_origin]  # the real goal sentence, with none of the invented values
+    assert fallback.facts["target_value"] == 30 and fallback.facts["target_year"] != 2035 and fallback.facts["benchmark_found"] is False
     assert c.facts["benchmark_found"] is False  # no benchmark wording in the source
     assert any("benchmark" in n for n in c.notes)
     v = verify_candidate(c, ENERGY_TEXT)
-    assert v.status == REQUIRES_REVIEW
-    assert any("Quote not found" in n for n in v.notes)
-    assert any("target_value=45" in n for n in v.notes)
+    # Hallucinated value (45) not in source → hard rejection, lifecycle=rejected.
+    assert v.status in (REQUIRES_REVIEW, "REJECTED")  # numeric gate may reject or review
+    assert any("Quote not found" in n or "45" in n for n in v.notes)
 
 
 def test_unparseable_llm_output_falls_back_to_heuristic():

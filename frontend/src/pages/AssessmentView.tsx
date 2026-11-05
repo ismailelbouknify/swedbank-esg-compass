@@ -65,7 +65,7 @@ export default function AssessmentView() {
   const pending = ordered.filter((r) => r.review_status === "PENDING");
   // items with evidence first; data gaps after
   const reviewQueue = [...pending.filter((r) => r.review_state === "review"), ...pending.filter((r) => r.review_state === "no_evidence")];
-  const gaps = ordered.filter((r) => r.evidence_status === "NO_EVIDENCE_FOUND");
+  const gaps = ordered.filter((r) => r.evidence_status === "NO_EVIDENCE_FOUND" || r.evidence_status === "INSUFFICIENT_SOURCE_COVERAGE");
 
   // the next pending item after the open one (wrapping around); an item just approved has left the queue
   const nextAfter = (current: number | null): Recommendation | undefined => {

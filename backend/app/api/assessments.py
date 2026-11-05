@@ -23,12 +23,16 @@ from app.schemas.api import (
     EvidenceAuditOut, RecommendationOut, SourceOut, StageOut, StatusOut,
 )
 from app.services.assessments import registry
-from app.services.audit import log_event
+from app.services.audit import log_event, log_source_rejection
 from app.services.company.identify import normalize_company_name, normalize_org_number
-from app.services.documents.url_safety import UnsafeURLError, normalize_website, registrable_domain, validate_public_url
+from app.services.documents.url_safety import normalize_website, registrable_domain
 from app.services.export import exporter
 from app.services.pipeline.runner import run_assessment
 from app.services.presentation import EXPORT_FILE_PREFIX, PUBLIC_STAGES, public_stage
+from app.services.security import policy
+from app.services.security.content_validator import validate_uploaded_pdf
+from app.services.security.policy import SourceRejection
+from app.services.security.url_validator import UnsafeURLError, validate_external_url
 
 router = APIRouter(prefix="/api/assessments", tags=["assessments"])
 
@@ -38,6 +42,13 @@ def _get(db: Session, assessment_id: int) -> Assessment:
     if a is None:
         raise HTTPException(404, "Assessment not found")
     return a
+
+
+_UPLOAD_REJECTIONS = {
+    policy.INVALID_PDF_SIGNATURE: (415, "File is not a valid PDF"),
+    policy.PDF_ENCRYPTED: (422, "Password-protected PDFs cannot be read."),
+    policy.MALWARE_SCAN_FAILED: (422, "The file could not be accepted."),
+}
 
 
 def sanitize_filename(name: str | None) -> str:
@@ -78,9 +89,12 @@ def create_assessment(body: AssessmentCreate, db: Session = Depends(get_db)) -> 
     website = normalize_website(body.website)
     if website:
         try:
-            validate_public_url(website, resolve_dns=False)
+            validate_external_url(website, resolve_dns=False, enforce_domain_policy=False)
         except UnsafeURLError as exc:
-            raise HTTPException(422, f"Invalid website: {exc}") from exc
+            # the allowlist is applied when fetching: in itself it does not make a company invalid
+            raise HTTPException(422, "Invalid website: enter a public https:// address.") from exc
+    settings = get_settings()
+    enable_web_search = body.enable_web_search and settings.enable_web_search and settings.enable_external_fetch
     existing = registry.current_matches(db, body.company_name, body.year, body.organisation_number, body.country)
     running = [a for a in existing if a.status == "RUNNING"]
     if running:
@@ -98,7 +112,7 @@ def create_assessment(body: AssessmentCreate, db: Session = Depends(get_db)) -> 
     db.flush()
     # an unambiguous saved assessment is replaced by this new version once it completes
     previous = completed[0] if len({registry.identity(a) for a in completed}) == 1 else None
-    a = _new_version(db, company, body.year, body.enable_web_search, previous)
+    a = _new_version(db, company, body.year, enable_web_search, previous)
     registry.abandon_unfinished(a, existing)
     log_event(db, "assessment_created", assessment_id=a.id, entity_type="assessment", entity_id=a.id, actor="analyst",
               details={**body.model_dump(), "assessment_version": a.assessment_version, "supersedes_id": a.supersedes_id})
@@ -146,8 +160,14 @@ async def upload_document(
         data.extend(chunk)
         if len(data) > limit:
             raise HTTPException(413, f"File exceeds {get_settings().max_pdf_size_mb} MB limit")
-    if not bytes(data[:5]).startswith(b"%PDF"):
-        raise HTTPException(415, "File is not a valid PDF")
+    try:
+        pages, scan_status = validate_uploaded_pdf(bytes(data))
+    except SourceRejection as exc:
+        log_source_rejection(db, exc, assessment_id=a.id, url=None, stage="upload")
+        db.commit()
+        if exc.code == policy.PDF_PAGE_LIMIT_EXCEEDED:
+            raise HTTPException(413, f"The PDF exceeds the {get_settings().max_pdf_pages} page limit.") from exc
+        raise HTTPException(*_UPLOAD_REJECTIONS.get(exc.code, (422, "The PDF could not be read."))) from exc
     # stored under a generated name: the user-supplied name never touches the filesystem
     path = get_settings().upload_dir / f"{uuid.uuid4().hex}.pdf"
     path.write_bytes(bytes(data))
@@ -158,7 +178,7 @@ async def upload_document(
     db.add(s)
     db.flush()
     log_event(db, "document_uploaded", assessment_id=a.id, entity_type="source", entity_id=s.id, actor="analyst",
-              details={"filename": filename, "bytes": len(data), "is_public": is_public})
+              details={"filename": filename, "bytes": len(data), "is_public": is_public, "pages": pages, "scan": scan_status})
     db.commit()
     db.refresh(s)
     return source_out(s)

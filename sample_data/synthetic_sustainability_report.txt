@@ -28,6 +28,7 @@ In 2024 we conducted labour rights audits at 12 supplier sites.
 Working conditions for our employees significantly improved during the year.
 ---PAGE---
 Data Security
+Our data security goal is to achieve and maintain ISO 27001 certification across all sites and to keep the number of data breaches at zero.
 We maintain an information security policy approved by the Board of Directors, which sets out our approach to data protection and cybersecurity.
 In 2025 we completed ISO 27001 certification of the information security management system at our headquarters.
 Product Design and Lifecycle Management

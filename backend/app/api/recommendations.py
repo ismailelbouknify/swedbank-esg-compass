@@ -54,6 +54,8 @@ def review(rec_id: int, body: ReviewRequest, db: Session = Depends(get_db)) -> R
         r.review_status = "OVERRIDDEN"
         event = "recommendation_overridden"
     else:
+        if r.recommended_level < 1:
+            raise HTTPException(422, "Nothing was concluded for this question. Upload a report, or set a level with a comment.")
         r.final_level = r.recommended_level
         r.review_status = "APPROVED"
         event = "recommendation_approved"

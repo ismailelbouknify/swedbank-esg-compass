@@ -54,7 +54,7 @@ RULE_REASONS = {
 }
 
 
-def score_planning(evidence: list[EvidenceItem] | dict[str, Any], factor_label: str = "the factor") -> ScoreResult | tuple[int, str, list[str]]:
+def score_planning(evidence: list[EvidenceItem] | dict[str, Any], factor_label: str = "the factor", factor_key: str | None = None) -> ScoreResult | tuple[int, str, list[str]]:
     """Score planning from structured goal evidence.
 
     Accepts a list of EvidenceItem (full scoring) or a plain flags dict (rule table only)."""
@@ -81,9 +81,12 @@ def score_planning(evidence: list[EvidenceItem] | dict[str, Any], factor_label: 
 
     # A level-5 goal reaches 6 only if the benchmark is about that goal: stated in the goal itself or on
     # the same page of the same source (an SBTi climate target elsewhere does not benchmark a waste goal).
+    # If the benchmark evidence carries a benchmark_factor tag, it must match the current factor.
     if level == 5:
         bench = [e for e in verified if e.facts.get("benchmark_found") and e.source_id == best.source_id
-                 and (e.id == best.id or e.page_number == best.page_number)]
+                 and (e.id == best.id or e.page_number == best.page_number)
+                 and (not e.facts.get("benchmark_factor") or not factor_key
+                      or e.facts.get("benchmark_factor") == factor_key)]
         if bench:
             level, rule, missing = 6, "P6_BENCHMARKED_AMBITION", []
             best_bench = bench[0]

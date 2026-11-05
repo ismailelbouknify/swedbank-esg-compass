@@ -77,6 +77,16 @@ def _find_conflicts(series: list[EvidenceItem]) -> list[str]:
     return conflicts
 
 
+def _unit_compatible(unit_a: str | None, unit_b: str | None) -> bool:
+    """Two series are unit-compatible when they share the same unit (or both lack one).
+    Prevents combining 'energy intensity (kWh/unit)' with 'renewable share (%)'."""
+    if unit_a is None and unit_b is None:
+        return True
+    if unit_a is None or unit_b is None:
+        return False  # one has a unit, the other doesn't — not comparable
+    return unit_a.strip().lower() == unit_b.strip().lower()
+
+
 def score_performance(evidence: list[EvidenceItem], factor_label: str = "the factor", assessment_year: int = 2025) -> ScoreResult:
     items = [e for e in evidence if e.claim_type in ("performance_series", "relative_change", "sector_comparison", "unquantified_improvement_claim")]
     verified, unverified = split_verified([e for e in items if e.claim_type != "unquantified_improvement_claim"])
@@ -84,6 +94,7 @@ def score_performance(evidence: list[EvidenceItem], factor_label: str = "the fac
 
     improving: list[tuple[EvidenceItem, dict[str, Any]]] = []
     worsening: list[tuple[EvidenceItem, dict[str, Any]]] = []
+    skipped_unit_mismatch: list[str] = []
     for e in verified:
         if e.claim_type == "performance_series":
             ev = evaluate_series(e.facts.get("points", []), e.facts.get("better", "lower"), assessment_year)
@@ -92,6 +103,20 @@ def score_performance(evidence: list[EvidenceItem], factor_label: str = "the fac
         else:
             continue
         if ev is None:
+            continue
+        # Unit-compatibility guard: don't mix series with incompatible units for the
+        # same metric.  If we already have an improving/worsening series with this
+        # metric name but a different unit, skip rather than combine.
+        metric_name = e.facts.get("metric", "")
+        e_unit = e.facts.get("unit")
+        existing_units = {
+            existing.facts.get("unit") for existing, _ in (improving + worsening)
+            if existing.facts.get("metric", "") == metric_name
+        }
+        if existing_units and not any(_unit_compatible(e_unit, u) for u in existing_units):
+            skipped_unit_mismatch.append(
+                f"{metric_name} ({e_unit or 'no unit'}) skipped: incompatible with existing unit(s) {sorted(existing_units)}"
+            )
             continue
         e.facts["evaluation"] = ev
         (improving if ev["improved"] else worsening).append((e, ev))
@@ -135,6 +160,8 @@ def score_performance(evidence: list[EvidenceItem], factor_label: str = "the fac
         r.conditions["quantitative_improvement"].detail = "; ".join(describe_change(e, ev) for e, ev in improving[:3])
     if vague:
         r.notes.append(f"{len(vague)} unquantified improvement claim(s) found; not accepted as quantitative evidence.")
+    if skipped_unit_mismatch:
+        r.notes.append(f"{len(skipped_unit_mismatch)} series skipped due to unit incompatibility: " + "; ".join(skipped_unit_mismatch[:3]))
     if mixed:
         r.notes.append(f"Metrics with both improving and worsening data points: {', '.join(mixed)}.")
     if conflicts:

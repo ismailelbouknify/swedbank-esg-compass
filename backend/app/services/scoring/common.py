@@ -4,8 +4,11 @@ Scoring functions receive structured evidence (facts dicts + IDs), never raw LLM
 Only VERIFIED evidence can raise a level; unverified evidence is reported, not used."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 FOUND = "FOUND"
 NO_EVIDENCE_FOUND = "NO_EVIDENCE_FOUND"
@@ -74,6 +77,20 @@ def split_verified(items: list[EvidenceItem]) -> tuple[list[EvidenceItem], list[
     verified = [e for e in items if e.verified]
     unverified = [e.id for e in items if not e.verified]
     return verified, unverified
+
+
+class ScoringInvariantError(RuntimeError):
+    pass
+
+
+def assert_scoring_evidence(evidence_ids: list[int], scoring_ids: set[int]) -> list[int]:
+    """Invariant: recommendation.evidence_ids is a subset of the accepted evidence used for scoring. Scoring
+    only ever receives such evidence, so anything else is a defect: the scoring step stops instead of continuing."""
+    invalid = sorted(set(evidence_ids) - scoring_ids)
+    if invalid:
+        log.error("scoring_invariant_violation: non_scoring_evidence=%s", invalid)
+        raise ScoringInvariantError(f"Recommendation cites evidence not accepted for scoring: {invalid}")
+    return evidence_ids
 
 
 def finalize_status(result: ScoreResult) -> ScoreResult:

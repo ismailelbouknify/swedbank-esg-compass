@@ -4,6 +4,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -11,10 +12,24 @@ PROJECT_DIR = BACKEND_DIR.parent
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=BACKEND_DIR / ".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=BACKEND_DIR / ".env", extra="ignore", populate_by_name=True)
 
     database_url: str = f"sqlite:///{(BACKEND_DIR / 'esg.db').as_posix()}"
     data_dir: Path = BACKEND_DIR / "data"
+
+    # --- Restricted security mode ----------------------------------------
+    # Security-hardened configuration for controlled environments; see the README. It reduces
+    # technical risk but does not replace organisational security review or malware scanning.
+    bank_safe_mode: bool = True
+    enable_web_search: bool = True  # False: no request ever reaches a search provider
+    enable_external_fetch: bool = True  # False: no external page or document is retrieved
+    enable_playwright: bool = Field(False, validation_alias=AliasChoices("enable_playwright", "use_playwright"))
+    allow_http: bool = False  # only read in restricted mode; outside it plain HTTP stays possible
+    store_downloaded_files: bool = False  # ignored in restricted mode: external PDFs are never stored
+    allowed_external_domains: str = ""  # comma-separated; empty = any host passing the public-web checks
+    allowed_domains_include_subdomains: bool = True
+    malware_scan_required: bool = False  # fail closed when no scanner is registered
+    allowed_hosts: str = "localhost,127.0.0.1"  # Host headers the web server answers in restricted mode
 
     # --- Local LLM -------------------------------------------------------
     llm_provider: str = "llama_cpp"  # llama_cpp | ollama | none
@@ -34,12 +49,28 @@ class Settings(BaseSettings):
     serpapi_api_key: str = ""
     max_search_results: int = 10
     max_pages_per_site: int = 10
-    max_pdf_size_mb: int = 50
+    max_pdf_size_mb: int = 50  # manual uploads
+    max_download_mb: int = 20  # any automatically retrieved document
     max_html_size_mb: int = 5
+    max_pdf_pages: int = 300
     max_downloaded_pdfs: int = 3
-    http_timeout_seconds: int = 20
-    max_redirects: int = 5
-    use_playwright: bool = False
+    max_redirects: int = 3
+    max_http_retries: int = 2
+    http_connect_timeout_seconds: float = 10
+    http_read_timeout_seconds: float = 30
+    max_source_processing_seconds: float = 60  # one source, from first request to extracted text
+
+    # --- Source coverage / recovery search -------------------------------
+    coverage_min_valid_sources: int = 3
+    coverage_max_factors_without_candidates: float = 0.6
+    coverage_max_company_rejection_share: float = 0.5
+    coverage_min_report_page_chars: int = 5000  # below this, a "report" web page only lists reports
+    recovery_search_enabled: bool = True
+    recovery_max_queries: int = 10
+    recovery_max_pages: int = 5
+    recovery_max_pdfs: int = 2
+    recovery_time_budget_seconds: float = 180
+    recovery_search_pause_seconds: float = 1.0
 
     # --- Retrieval / extraction ------------------------------------------
     chunk_size_words: int = 180
@@ -52,6 +83,23 @@ class Settings(BaseSettings):
     max_llm_context_chars: int = 6000  # ~1500 tokens of passage text
 
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+
+    @property
+    def http_allowed(self) -> bool:
+        return self.allow_http or not self.bank_safe_mode
+
+    @property
+    def store_external_files(self) -> bool:
+        return self.store_downloaded_files and not self.bank_safe_mode
+
+    @property
+    def allowed_domains(self) -> tuple[str, ...]:
+        entries = (d.strip().lower().removeprefix("*.").strip(".") for d in self.allowed_external_domains.split(","))
+        return tuple(d for d in entries if d)
+
+    @property
+    def allowed_host_list(self) -> list[str]:
+        return [h.strip() for h in self.allowed_hosts.split(",") if h.strip()]
 
     @property
     def resolved_model_path(self) -> Path:

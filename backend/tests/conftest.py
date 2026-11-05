@@ -13,6 +13,7 @@ os.environ["DATABASE_URL"] = f"sqlite:///{(_TMP / 'test.db').as_posix()}"
 os.environ["DATA_DIR"] = str(_TMP / "data")
 os.environ["LLM_PROVIDER"] = "none"
 os.environ["SEARCH_PROVIDER"] = "none"
+os.environ["ALLOWED_HOSTS"] = "localhost,127.0.0.1,testserver"
 
 import pytest  # noqa: E402
 

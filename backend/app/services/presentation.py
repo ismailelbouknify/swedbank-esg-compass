@@ -72,8 +72,8 @@ def review_state(review_status: str, evidence_status: str) -> str:
         return "approved"
     if review_status == "OVERRIDDEN":
         return "changed"
-    if evidence_status == "NO_EVIDENCE_FOUND":
-        return "no_evidence"
+    if evidence_status in ("NO_EVIDENCE_FOUND", "INSUFFICIENT_SOURCE_COVERAGE"):
+        return "no_evidence"  # no level to show; coverage_state says which of the two it is
     return "review"
 
 
@@ -88,6 +88,7 @@ SOURCE_STATUS_LABEL = {
     "PROCESSED": "Processed",
     "OCR_REQUIRED": "Could not be read (scanned document)",
     "FAILED": "Could not be read",
+    "REJECTED": "Source could not be processed",
     "SKIPPED": "Skipped",
     "DISCOVERED": "Not processed",
     "DOWNLOADED": "Not processed",

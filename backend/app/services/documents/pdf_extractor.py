@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pymupdf as fitz  # PyMuPDF
+
+from app.services.security import policy
+from app.services.security.content_validator import ContentRejected, enforce_page_limit, validate_pdf_signature
 
 # A page with fewer extractable characters than this is considered "image-like".
 MIN_CHARS_PER_TEXT_PAGE = 40
@@ -43,19 +47,60 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def extract_pdf(path: str | Path) -> ExtractedDocument:
-    """Extract per-page text. Raises ValueError if the file is not a readable PDF."""
+def _open_pdf(source: str | Path | bytes) -> fitz.Document:
+    """Open as PDF only, whatever the name or content claims: no other parser is reachable from here."""
+    if isinstance(source, bytes):
+        head = source[:5]
+    else:
+        try:
+            with open(source, "rb") as f:
+                head = f.read(5)
+        except OSError as exc:
+            raise ValueError("Could not read PDF file") from exc
+    validate_pdf_signature(head)
     try:
-        doc = fitz.open(path)
+        if isinstance(source, bytes):
+            return fitz.open(stream=source, filetype="pdf")
+        return fitz.open(source, filetype="pdf")
     except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"Could not open PDF: {exc}") from exc
+        raise ValueError(f"Could not open PDF: {type(exc).__name__}") from exc
+
+
+def peek_pdf(content: bytes, pages: int = 5) -> tuple[str | None, str]:
+    """Title and first pages of a PDF refused for its length: enough to tell whose report it is.
+    Nothing is kept, and the document is not processed. Returns (None, "") if it cannot be read."""
+    try:
+        doc = _open_pdf(content)
+    except ValueError:
+        return None, ""
     try:
         if doc.needs_pass:
-            raise ValueError("PDF is password protected")
+            return None, ""
+        text = "\n".join(doc[i].get_text("text") or "" for i in range(min(pages, doc.page_count)))
+        return (doc.metadata or {}).get("title") or None, text
+    except Exception:  # noqa: BLE001 — this only refines a rejection that has already happened
+        return None, ""
+    finally:
+        doc.close()
+
+
+def extract_pdf(source: str | Path | bytes, *, deadline: float | None = None) -> ExtractedDocument:
+    """Extract per-page text from a file or from in-memory bytes. Text only: nothing embedded in the
+    PDF is run. Raises ValueError (ContentRejected for policy reasons) if the PDF cannot be used."""
+    doc = _open_pdf(source)
+    try:
+        if doc.needs_pass:
+            raise ContentRejected(policy.PDF_ENCRYPTED, "PDF is password protected")
+        enforce_page_limit(doc.page_count)
         pages: list[ExtractedPage] = []
         empty = 0
         for i, page in enumerate(doc):
-            text = clean_text(page.get_text("text") or "")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise ContentRejected(policy.SOURCE_TIMEOUT, "Source processing time limit reached")
+            try:
+                text = clean_text(page.get_text("text") or "")
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"Could not read PDF page {i + 1}: {type(exc).__name__}") from exc
             if len(text) < MIN_CHARS_PER_TEXT_PAGE:
                 empty += 1
             pages.append(ExtractedPage(page_number=i + 1, text=text))

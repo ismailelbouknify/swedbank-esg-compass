@@ -55,6 +55,8 @@ class Assessment(Base):
     llm_provider: Mapped[str | None] = mapped_column(String(50))
     llm_model: Mapped[str | None] = mapped_column(String(255))
     extraction_mode: Mapped[str | None] = mapped_column(String(20))  # llm | heuristic
+    company_identity: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)  # resolved identity profile
+    coverage_metrics: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)  # audit export only
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -85,10 +87,17 @@ class Source(Base):
     is_public: Mapped[bool] = mapped_column(Boolean, default=True)
     is_official: Mapped[bool] = mapped_column(Boolean, default=False)
     discovered_via: Mapped[str | None] = mapped_column(String(255))  # search query / upload / link
-    # DISCOVERED | DOWNLOADED | PROCESSED | OCR_REQUIRED | SKIPPED | FAILED
+    # DISCOVERED | DOWNLOADED | PROCESSED | OCR_REQUIRED | SKIPPED | FAILED (unavailable) | REJECTED (security policy)
     status: Mapped[str] = mapped_column(String(20), default="DISCOVERED")
     status_detail: Mapped[str | None] = mapped_column(Text)
     content_type: Mapped[str | None] = mapped_column(String(100))
+    # external retrieval metadata; raw bytes of external documents are never stored in the database
+    fetch_outcome: Mapped[str | None] = mapped_column(String(40))  # ok | rejection/unavailability code
+    content_sha256: Mapped[str | None] = mapped_column(String(64))
+    bytes_downloaded: Mapped[int | None] = mapped_column(Integer)
+    # identity gate: how the source was tied to the assessed company, or "mismatch"
+    company_match: Mapped[str | None] = mapped_column(String(30))
+    rejection_reason: Mapped[str | None] = mapped_column(String(60))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     assessment: Mapped[Assessment] = relationship(back_populates="sources")
@@ -166,6 +175,17 @@ class Evidence(Base):
     verification_status: Mapped[str] = mapped_column(String(20), default="REQUIRES_REVIEW")
     verification_notes: Mapped[list[str]] = mapped_column(JSON, default=list)
 
+    # Evidence lifecycle (NULL = legacy row).  candidate → accepted | rejected.
+    # Only "accepted" evidence is allowed to influence questionnaire scoring.
+    evidence_lifecycle: Mapped[str | None] = mapped_column(String(20), default=None)
+    # Machine-readable rejection codes: quote_not_found | factor_mismatch | company_mismatch |
+    # dimension_mismatch | numeric_not_in_source | exclusion_keyword_match | cross_factor_mismatch |
+    # external_actor | inactive_goal | activity_not_performed | ambiguous_table_alignment
+    rejection_codes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    # Set when the model's quote could not be used and a pre-filter sentence from the source was taken instead.
+    evidence_origin: Mapped[str | None] = mapped_column(String(40), default=None)
+    llm_quote_failed: Mapped[bool] = mapped_column(Boolean, default=False)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     source: Mapped[Source] = relationship()
@@ -181,10 +201,14 @@ class Recommendation(Base):
 
     recommended_level: Mapped[int] = mapped_column(Integer)
     max_level: Mapped[int] = mapped_column(Integer)
-    # FOUND | NO_EVIDENCE_FOUND | CONFLICTING_EVIDENCE | REQUIRES_REVIEW
+    # FOUND | NO_EVIDENCE_FOUND | CONFLICTING_EVIDENCE | REQUIRES_REVIEW | INSUFFICIENT_SOURCE_COVERAGE
     evidence_status: Mapped[str] = mapped_column(String(30))
+    # EVIDENCE_FOUND | NO_EVIDENCE_FOUND | INSUFFICIENT_SOURCE_COVERAGE (then recommended_level is 0: not assessed)
+    coverage_state: Mapped[str | None] = mapped_column(String(30), default=None)
     triggered_rule: Mapped[str] = mapped_column(String(120))
     reason: Mapped[str] = mapped_column(Text)
+    # AI rationale preserved separately so analyst overrides don't corrupt the explanation.
+    ai_reason: Mapped[str | None] = mapped_column(Text)
     conditions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     next_level_missing: Mapped[list[str]] = mapped_column(JSON, default=list)
     notes: Mapped[list[str]] = mapped_column(JSON, default=list)

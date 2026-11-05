@@ -1,7 +1,7 @@
 // Typed client for the FastAPI backend (see backend/app/schemas/api.py).
 // Only analyst-facing fields are typed here; technical metadata stays in the backend.
 
-export type EvidenceStatus = "FOUND" | "NO_EVIDENCE_FOUND" | "CONFLICTING_EVIDENCE" | "REQUIRES_REVIEW";
+export type EvidenceStatus = "FOUND" | "NO_EVIDENCE_FOUND" | "CONFLICTING_EVIDENCE" | "REQUIRES_REVIEW" | "INSUFFICIENT_SOURCE_COVERAGE";
 export type ReviewStatus = "PENDING" | "APPROVED" | "OVERRIDDEN";
 export type ReviewState = "review" | "approved" | "changed" | "no_evidence";
 export type AssessmentStatus = "CREATED" | "RUNNING" | "COMPLETED" | "FAILED";
@@ -100,6 +100,7 @@ export interface Recommendation {
   max_level: number;
   level_description: string;
   evidence_status: EvidenceStatus;
+  coverage_state?: "EVIDENCE_FOUND" | "NO_EVIDENCE_FOUND" | "INSUFFICIENT_SOURCE_COVERAGE" | null;
   reason: string;
   conditions: Record<string, Condition>;
   next_level_missing: string[];

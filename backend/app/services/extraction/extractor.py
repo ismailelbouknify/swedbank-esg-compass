@@ -12,24 +12,22 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from app.config.loader import get_factor, load_rules
+from app.config.loader import OFFICIAL_SOURCE_TYPES, REPORT_SOURCE_TYPES, get_factor, load_rules
+from app.services.company.source_identity import PARENT_BOUNDARY
+from app.services.extraction import gates
 from app.services.extraction import patterns as P
 from app.services.extraction import prompts
+from app.services.extraction.gates import ACTIVITY_RE, STRONG_GOAL_RE
 from app.services.llm.base import LLMProvider, LLMUnavailableError
 from app.services.llm.json_utils import LLMOutputError, as_bool, as_confidence, as_float, as_year, parse_llm_json
 
 log = logging.getLogger(__name__)
 
-ACTIVITY_RE = re.compile(
-    r"\b(implemented|installed|introduced|launched|invested|rolled out|completed|conducted|upgraded|replaced|"
-    r"carried out|established|deployed|trained|certified|organi[sz]ed|held|started|began|opened|renewed|signed|"
-    r"performed|achieved|appointed|adopted|updated|expanded|piloted|retrofitted|converted|switched|audited|assessed)\b",
-    re.IGNORECASE,
-)
-STRONG_GOAL_RE = re.compile(
-    r"\b(targets?|goals?|aims?|aiming|ambitions?|commit(?:s|ted|ment|ments)?|pledge[sd]?|policy|policies|strategy|objectives?|roadmap|strives?)\b",
-    re.IGNORECASE,
-)
+
+MAX_UNALIGNED_ROWS_PER_PASSAGE = 5
+QUOTE_FALLBACK = "deterministic_quote_fallback"
+QUOTE_FALLBACK_METHOD = "quote_fallback"
+MAX_FALLBACK_SENTENCE_WORDS = 60
 
 
 @dataclass
@@ -46,6 +44,7 @@ class Passage:
     text: str
     doc_year: int | None = None
     retrieval_score: float = 0.0
+    identity_basis: str | None = None  # how the source was tied to the company
 
     @property
     def label(self) -> str:
@@ -70,6 +69,8 @@ class Candidate:
     target_year: int | None = None
     baseline_year: int | None = None
     notes: list[str] = field(default_factory=list)
+    evidence_origin: str | None = None
+    llm_quote_failed: bool = False
 
 
 class FactExtractor:
@@ -105,11 +106,11 @@ class FactExtractor:
             return None
         except LLMOutputError as exc:
             self.llm_failures += 1
-            log.warning("Unparseable LLM output: %s", exc)
+            log.warning("llm_output_unparseable: failures=%d", self.llm_failures)  # never the output: it quotes report text
             return None
         except Exception as exc:  # noqa: BLE001
             self.llm_failures += 1
-            log.warning("LLM call failed: %s", exc)
+            log.warning("llm_call_failed: error=%s", type(exc).__name__)
             return None
 
     def _llm_meta(self) -> tuple[str, str | None]:
@@ -134,6 +135,9 @@ class FactExtractor:
                 c = self._planning_from_llm(factor, p, data)
                 if c:
                     out.append(c)
+                    fallback = self._planning_quote_fallback(factor, p, c, goal_sentences)
+                    if fallback:
+                        out.append(fallback)
                 continue
             if self.allow_heuristic:
                 out.extend(self._planning_heuristic(factor, p, goal_sentences))
@@ -186,33 +190,66 @@ class FactExtractor:
             as_confidence(d.get("confidence")), target_value, d.get("target_unit"), target_year, baseline_year, notes,
         )
 
+    def _goal_facts(self, factor: dict[str, Any], p: Passage, s: str, t: P.TargetSignal) -> dict[str, Any]:
+        common = self._planning_common(factor, p, s)
+        return {
+            "goal_found": True,
+            "formalized": True,
+            "public": p.is_public,
+            "quantitative": t.quantitative,
+            "time_bound": t.target_year is not None,
+            "target_value": t.target_value,
+            "target_unit": t.target_unit,
+            "target_year": t.target_year,
+            "baseline_year": t.baseline_year,
+            "clear_owner": bool(common["owner_terms_in_text"]),
+            "owner": ", ".join(common["owner_terms_in_text"][:2]) or None,
+            "benchmark_found": bool(common["benchmark_types_in_text"]),
+            "benchmark_type": (common["benchmark_types_in_text"] or [None])[0],
+        }
+
     def _planning_heuristic(self, factor: dict[str, Any], p: Passage, sentences: list[str]) -> list[Candidate]:
         out = []
         for s in sentences[:3]:
             t = P.detect_target(s, p.doc_year or self.year)
             if t is None:
                 continue
-            common = self._planning_common(factor, p, s)
-            facts = {
-                "goal_found": True,
-                "formalized": True,
-                "public": p.is_public,
-                "quantitative": t.quantitative,
-                "time_bound": t.target_year is not None,
-                "target_value": t.target_value,
-                "target_unit": t.target_unit,
-                "target_year": t.target_year,
-                "baseline_year": t.baseline_year,
-                "clear_owner": bool(common["owner_terms_in_text"]),
-                "owner": ", ".join(common["owner_terms_in_text"][:2]) or None,
-                "benchmark_found": bool(common["benchmark_types_in_text"]),
-                "benchmark_type": (common["benchmark_types_in_text"] or [None])[0],
-            }
+            facts = self._goal_facts(factor, p, s, t)
             out.append(Candidate(
                 factor["key"], "planning", "goal", _goal_claim(factor["label"], facts), facts, s, p, "heuristic", None,
                 None, t.target_value, t.target_unit, t.target_year, t.baseline_year,
             ))
         return out
+
+    def _planning_quote_fallback(self, factor: dict[str, Any], p: Passage, llm_candidate: Candidate, sentences: list[str]) -> Candidate | None:
+        """The model reported a goal but could not quote it: use the goal sentence the pre-filter already
+        found in this passage. No model call, and none of the model's values are carried over. The result
+        still has to pass verification like any other evidence before it can affect a score."""
+        failure = gates.goal_quote_failure(llm_candidate.evidence_text, p.text)
+        if failure is None or not self._factor_relevant_or_unquoted(factor, llm_candidate.evidence_text, failure):
+            return None
+        eligible: list[tuple[P.TargetSignal, str]] = []
+        for s in sentences:
+            t = P.detect_target(s, p.doc_year or self.year)
+            if (t is not None and gates.FORWARD_PLANNING_RE.search(s) and P.normalize_ws(s) in P.normalize_ws(p.text)
+                    and "|" not in s and len(s.split()) <= MAX_FALLBACK_SENTENCE_WORDS
+                    and not _deadline_has_passed(s, self.year)):
+                eligible.append((t, s))
+        if not eligible:
+            return None
+        t, s = max(eligible, key=lambda pair: (pair[0].quantitative, pair[0].target_year is not None))
+        facts = {**self._goal_facts(factor, p, s, t), "llm_quote_failure": failure}
+        return Candidate(
+            factor["key"], "planning", "goal", _goal_claim(factor["label"], facts), facts, s, p, QUOTE_FALLBACK_METHOD, None,
+            None, t.target_value, t.target_unit, t.target_year, t.baseline_year,
+            notes=[f"The extraction quote could not be used ({failure}); this goal sentence was taken from the source text instead."],
+            evidence_origin=QUOTE_FALLBACK, llm_quote_failed=True,
+        )
+
+    @staticmethod
+    def _factor_relevant_or_unquoted(factor: dict[str, Any], quote: str, failure: str) -> bool:
+        """A located quote about another factor means the answer failed on factor, which is never rescued."""
+        return failure != "not_a_goal_statement" or bool(P.matched_terms(quote, factor["keywords"]))
 
     # ------------------------------------------------------------------ execution
     def execution(self, factor_key: str, passages: list[Passage]) -> list[Candidate]:
@@ -223,6 +260,7 @@ class FactExtractor:
             sentences = [
                 s for s in P.split_sentences(p.text)
                 if ACTIVITY_RE.search(s) and P.matched_terms(s, factor["keywords"]) and not re.search(r"\b(will|plan to|plans to|intend)\b", s, re.I)
+                and not gates.activity_not_performed(s) and not gates.external_actor_only(s)
             ]
             if not sentences:
                 continue
@@ -272,12 +310,22 @@ class FactExtractor:
         for p in passages:
             found_numeric = False
             # 1) deterministic series / relative changes
-            for s in P.extract_series(p.text):
+            aligned, unaligned = P.extract_series_with_rejections(p.text)
+            for s in aligned:
                 metric = P.match_metric(s.metric_label, factor)
                 if metric is None:
                     continue
                 found_numeric = True
                 out.append(self._series_candidate(factor, p, s, metric, "regex", None, None))
+            for s in unaligned[:MAX_UNALIGNED_ROWS_PER_PASSAGE]:
+                metric = P.match_metric(s.metric_label, factor)
+                if metric is None:
+                    continue
+                found_numeric = True  # the model would only guess the same alignment
+                out.append(Candidate(factor_key, "performance", "performance_series", f"{metric['name']}: values could not be aligned with years",
+                                     {"metric": metric["name"], "metric_label": s.metric_label[:200], "better": metric["better"], "unit": None,
+                                      "points": [], "ambiguous_alignment": s.meta.get("reason", "unaligned")},
+                                     s.quote, p, "regex"))
             for s in P.extract_from_to_changes(p.text, p.doc_year or self.year):
                 metric = P.match_metric(s.metric_label + " " + s.quote, factor)
                 if metric is None:
@@ -351,21 +399,23 @@ class FactExtractor:
         rules = self.rules["reporting_rules"]
         out: list[Candidate] = []
         for p in report_sources:
-            if p.source_type in ("sustainability_report", "annual_report", "uploaded_report"):
+            if p.identity_basis == PARENT_BOUNDARY:
+                continue  # the parent's report is the parent's reporting
+            if p.source_type in REPORT_SOURCE_TYPES:
                 regular = p.doc_year is not None or bool(re.search(r"\b(annual|yearly|every year|each year)\b", p.text, re.I))
                 out.append(Candidate("reporting", "reporting", "report_published",
                                      f"Sustainability information published in '{p.source_title or 'report'}'"
                                      + (f" ({p.doc_year})" if p.doc_year else ""),
                                      {"public": p.is_public, "regular": regular, "report_type": p.source_type, "report_year": p.doc_year},
                                      p.text, p, "regex"))
-            elif p.source_type == "company_website":
+            elif p.source_type in OFFICIAL_SOURCE_TYPES:
                 out.append(Candidate("reporting", "reporting", "voluntary_disclosure",
                                      "Sustainability information on company website",
                                      {"public": True}, p.text, p, "regex"))
         seen: set[tuple[str, str]] = set()
         assurance_llm_budget = 3  # the regex check covers the rest
         for p in passages:
-            if p.source_type not in ("uploaded_report", "sustainability_report", "annual_report", "company_website"):
+            if p.source_type not in OFFICIAL_SOURCE_TYPES or p.identity_basis == PARENT_BOUNDARY:
                 continue  # third-party pages cannot evidence the company's own reporting
             for fm in P.detect_frameworks(p.text):
                 key = (fm.framework, fm.sentence[:80])
@@ -417,8 +467,14 @@ FORWARD_RE = re.compile(r"\b(will|aims? to|aiming to|plans? to|intends? to|commi
 
 def is_goal_sentence(s: str, factor: dict[str, Any]) -> bool:
     return (len(s.split()) >= 6 and bool(STRONG_GOAL_RE.search(s)) and bool(P.matched_terms(s, factor["keywords"]))
-            and not ACTIVITY_RE.search(s)
+            and not ACTIVITY_RE.search(s) and not gates.is_inactive_goal(s) and not gates.external_goal_only(s)
             and not (P.CHANGE_VERB_RE.search(s) and not FORWARD_RE.search(s)))
+
+
+def _deadline_has_passed(sentence: str, year: int) -> bool:
+    """A goal whose only stated deadline lies before the assessment year is not a current goal."""
+    deadlines = [int(m.group(1)) for m in P.TARGET_YEAR_RE.finditer(sentence)]
+    return bool(deadlines) and max(deadlines) < year
 
 
 def _goal_claim(label: str, f: dict[str, Any]) -> str:
@@ -465,7 +521,8 @@ def passage_signal(factor_key: str, dimension: str, text: str) -> int:
     if dimension == "planning":
         return sum(1 for s in sentences if is_goal_sentence(s, factor))
     if dimension == "execution":
-        return sum(1 for s in sentences if ACTIVITY_RE.search(s) and P.matched_terms(s, factor["keywords"]) and not FUTURE_RE.search(s))
+        return sum(1 for s in sentences if ACTIVITY_RE.search(s) and P.matched_terms(s, factor["keywords"]) and not FUTURE_RE.search(s)
+                   and not gates.activity_not_performed(s) and not gates.external_actor_only(s))
     if dimension == "performance":
         series = P.extract_series(text) + P.extract_from_to_changes(text, None) + P.extract_relative_changes(text, None)
         return sum(2 for s in series if P.match_metric(s.metric_label + " " + s.quote, factor)) + (1 if len(set(P.find_years(text))) >= 2 else 0)

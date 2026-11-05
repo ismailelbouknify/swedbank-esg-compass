@@ -92,11 +92,15 @@ def normalize_ws(text: str) -> str:
 def contains_term(text: str, term: str) -> bool:
     if term.startswith("\\b") or any(c in term for c in "[]()?*+"):
         return re.search(term, text, re.IGNORECASE) is not None
+    # An acronym only counts in capitals ("LED" is not the verb "led"), unless the text has no capitals at all.
+    if term.isupper() and len(term) <= 4 and any(c.isupper() for c in text):
+        return re.search(rf"\b{re.escape(term)}\b", text) is not None
     t = term.lower()
     low = text.lower()
     if len(t) <= 4 and re.fullmatch(r"[a-z0-9]+", t):
         return re.search(rf"\b{re.escape(t)}\b", low) is not None
-    return t in low
+    # A whole word, inflections allowed: "labor" is not in "collaboration" or "laboratory", nor "wage" in "sewage".
+    return re.search(rf"(?<![a-z0-9]){re.escape(t)}(?:s|es|d|ed|ing|ers?)?(?![a-z0-9])", low) is not None
 
 
 def matched_terms(text: str, terms: list[str]) -> list[str]:
@@ -151,6 +155,15 @@ def detect_assurance(text: str) -> list[AssuranceMention]:
                 standard = std
                 break
         covers = any(k in low for k in ("sustainability", "esg", "non-financial", "gri", "esrs", "csrd", "report", "kpi", "indicators", "sasb"))
+        # Financial-statement or statutory-accounts assurance must not satisfy
+        # the sustainability assurance requirement (Reporting level 6).
+        financial_only = any(k in low for k in (
+            "financial statements", "statutory accounts", "financial report",
+            "consolidated financial", "annual accounts", "statutory audit",
+            "financial information only",
+        )) and not any(k in low for k in ("sustainability", "esg", "non-financial", "gri", "esrs", "csrd", "kpi"))
+        if financial_only:
+            covers = False
         level = "reasonable" if "reasonable assurance" in low else "limited" if "limited assurance" in low else None
         out.append(AssuranceMention(s, provider, standard, covers, level))
     return out
@@ -173,6 +186,45 @@ class TargetSignal:
     baseline_year: int | None
 
 
+_TARGET_CLAUSE_SPLIT_RE = re.compile(r";|,\s*(?:which|leading|while|whereas|but|however|although)\b|\b(?:but|however|whereas)\b", re.IGNORECASE)
+_STATISTIC_VERB_RE = re.compile(r"\b(?:represents?|representing|accounts?\s+for|accounting\s+for|according\s+to|surveyed|surveys?|study|studies|research|respondents?)\b", re.IGNORECASE)
+_POPULATION_AFTER_VALUE_RE = re.compile(
+    r"^\s*(?:%|per\s?cent|percent)?\s*of\s+(?:the\s+)?(?:all\s+|global\s+|world\s+|worldwide\s+|surveyed\s+)*"
+    r"(?:organi[sz]ations|companies|businesses|firms|respondents|banks|banking|executives|consumers|people|assets|investors|ceos|leaders|participants|households|market)\b",
+    re.IGNORECASE,
+)
+_FIRST_PERSON_RE = re.compile(r"\b(?:we|our)\b", re.IGNORECASE)
+_TARGET_LEAD_IN_RE = re.compile(
+    r"(?:\b(?:by|to|of|reach|reaching|achieve|achieving|least|most|maximum|minimum|below|under|above|over|than|targets?|goals?|is|are|be|cut|reduce|maintain|keep)|[:=])\s*$",
+    re.IGNORECASE,
+)
+_CHANGE_AFTER_VALUE_RE = re.compile(r"^\s*[A-Za-z]*\s*(?:reduction|decrease|increase|cut|lower|less|fewer|more)\b", re.IGNORECASE)
+
+
+def target_clause(sentence: str, position: int) -> tuple[str, int]:
+    """(the clause holding this position, the position within it)."""
+    start = 0
+    for m in _TARGET_CLAUSE_SPLIT_RE.finditer(sentence):
+        if m.start() >= position:
+            return sentence[start:m.start()], position - start
+        start = m.end()
+    return sentence[start:], position - start
+
+
+def value_is_statistic(clause: str, start: int, end: int) -> bool:
+    """'represents 40% of global assets', '86% of organisations': a measurement of someone else, not a target."""
+    if _STATISTIC_VERB_RE.search(clause):
+        return True
+    return bool(_POPULATION_AFTER_VALUE_RE.match(clause[end:])) and not _FIRST_PERSON_RE.search(clause)
+
+
+def value_is_tied_to_target(clause: str, start: int, end: int, is_percentage: bool) -> bool:
+    """A figure that merely stands nearby ('With 5,000 employees, we aim to ...') is not the target."""
+    if value_is_statistic(clause, start, end):
+        return False
+    return is_percentage or bool(_TARGET_LEAD_IN_RE.search(clause[:start]) or _CHANGE_AFTER_VALUE_RE.match(clause[end:]))
+
+
 def detect_target(sentence: str, reference_year: int | None = None) -> TargetSignal | None:
     """Detect a goal/target statement in one sentence. Returns None if no goal language."""
     if not TARGET_WORDS_RE.search(sentence):
@@ -192,7 +244,12 @@ def detect_target(sentence: str, reference_year: int | None = None) -> TargetSig
         if target_year == baseline_year:
             target_year = None
     value, unit = None, None
-    pct = PCT_RE.search(sentence)
+    pct = None
+    for m in PCT_RE.finditer(sentence):
+        clause, at = target_clause(sentence, m.start())
+        if value_is_tied_to_target(clause, at, at + len(m.group(1)), True):
+            pct = m
+            break
     if pct:
         value, unit = parse_number(pct.group(1)), "%"
     else:
@@ -200,10 +257,13 @@ def detect_target(sentence: str, reference_year: int | None = None) -> TargetSig
         if z:
             value, unit = 0.0, z.group(2).strip().split()[0]  # "zero fatalities", "net-zero emissions"
         else:
-            for m in re.finditer(rf"({NUM_PATTERN})\s*({UNIT_PATTERN})", sentence):
+            for m in re.finditer(rf"(?<![\w/.,])({NUM_PATTERN})\s*({UNIT_PATTERN})", sentence):
                 n = parse_number(m.group(1))
                 u = m.group(2)
                 if n is None or YEAR_RE.fullmatch(m.group(1).strip()) or u.lower() in UNIT_STOPWORDS:
+                    continue
+                clause, at = target_clause(sentence, m.start())
+                if not value_is_tied_to_target(clause, at, at + len(m.group(1)), False):
                     continue
                 value, unit = n, u
                 break
@@ -240,15 +300,19 @@ def _unit_from_label(label: str) -> str | None:
 
 
 def extract_series(text: str) -> list[Series]:
-    series: list[Series] = []
+    return extract_series_with_rejections(text)[0]
+
+
+def extract_series_with_rejections(text: str) -> tuple[list[Series], list[Series]]:
+    """(clearly aligned series, rows refused because values cannot be tied to years).
+    A false negative is preferred over a fabricated time series."""
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    series += _inline_year_value(text)
-    series += _from_to(text)
-    series += _tables(lines)
-    return _dedupe(series)
+    rejected: list[Series] = []
+    series = _inline_year_value(text, rejected) + _from_to(text) + _tables(lines, rejected)
+    return _dedupe(series), rejected
 
 
-def _inline_year_value(text: str) -> list[Series]:
+def _inline_year_value(text: str, rejected: list[Series]) -> list[Series]:
     out = []
     pair = re.compile(rf"\b(20\d{{2}})\s*[:=]\s*({NUM_PATTERN})\s*({UNIT_PATTERN})?")
     for sentence in split_sentences(text):
@@ -262,6 +326,10 @@ def _inline_year_value(text: str) -> list[Series]:
             first = pair.search(sentence)
             label = sentence[: first.start()].strip(" :-\u2013|") if first else sentence
             unit = next((u for u in units if u), None) or _unit_from_label(label)
+            if len(dict(pts)) != len({y for y, _ in pts}) or len({y for y, _ in pts}) != len(pts):
+                # one year with several values: the sentence holds more than one metric or scope
+                rejected.append(Series(label or sentence[:80], unit, [], sentence, meta={"reason": "repeated_year"}))
+                continue
             out.append(Series(label or sentence[:80], unit, pts, sentence))
     return out
 
@@ -317,10 +385,58 @@ def _has_text(line: str) -> bool:
     return bool(re.search(r"[A-Za-z]{2,}", line))
 
 
-def _tables(lines: list[str]) -> list[Series]:
-    """Handle 'Indicator 2023 2024 2025' headers followed by 'Label 124 116 108' rows,
-    including PyMuPDF's one-cell-per-line layout and labels printed above the year header."""
+# Header words that head a column without numbers in it.
+_TEXT_COLUMN_WORDS = {"unit", "units", "note", "notes", "gri", "source", "ref", "reference", "indicator", "metric", "kpi"}
+_NON_ACTUAL_QUALIFIERS = {"target", "targets", "goal", "goals", "ambition", "plan", "budget", "forecast", "by"}
+_CELL_TOKEN_RE = re.compile(rf"(?:{NUM_PATTERN})%?")
+MAX_ROW_LABEL_WORDS = 12
+
+
+def _header_columns(line: str) -> list[int | None]:
+    """Numeric columns named by a year header. None = a column that is not an actual year's value
+    ('2023 2024 Change', '2023 2024 Target 2030')."""
+    tokens = [t for t in re.split(r"[ \t|]+", line.strip()) if t]
+    positions = [i for i, t in enumerate(tokens) if re.fullmatch(r"(?:FY)?20\d{2}", t)]
+    columns: list[int | None] = []
+    for i in positions:
+        qualified = i > 0 and tokens[i - 1].lower() in _NON_ACTUAL_QUALIFIERS
+        columns.append(None if qualified else int(tokens[i][-4:]))
+    columns += [None for t in tokens[positions[-1] + 1:] if t.lower() not in _TEXT_COLUMN_WORDS]
+    return columns
+
+
+def _is_prose(line: str) -> bool:
+    return len(line.split()) >= 10 and line.rstrip()[-1:] in ".!?:"
+
+
+def _row_cells(line: str, width: int) -> tuple[list[str] | None, str, str | None, int]:
+    """(cell values if the row fills exactly `width` columns, label, unit printed in the cells, values seen)."""
+    tokens = [t for t in re.split(r"[ \t|]+", line.strip()) if t]
+    trailing = 0
+    while trailing < len(tokens) and _CELL_TOKEN_RE.fullmatch(tokens[-1 - trailing]):
+        trailing += 1
+    if trailing == width:
+        return [t.rstrip("%") for t in tokens[-width:]], " ".join(tokens[:-width]), None, trailing
+    # '124 kWh 116 kWh': the same unit printed in every cell
+    numeric = [i for i, t in enumerate(tokens) if _CELL_TOKEN_RE.fullmatch(t)]
+    if len(numeric) >= width and trailing <= 1:
+        cells = numeric[-width:]
+        fillers = [tokens[a + 1:b] for a, b in zip(cells, cells[1:])] + [tokens[cells[-1] + 1:]]
+        if all(len(f) == 1 for f in fillers) and len({f[0].lower() for f in fillers}) == 1:
+            return [tokens[i].rstrip("%") for i in cells], " ".join(tokens[:cells[0]]), fillers[0][0], width
+    return None, " ".join(tokens[:len(tokens) - trailing]), None, trailing
+
+
+def _tables(lines: list[str], rejected: list[Series] | None = None) -> list[Series]:
+    """Handle 'Indicator 2023 2024 2025' headers followed by 'Label 124 116 108' rows, including PyMuPDF's
+    one-cell-per-line layout and labels printed above the year header. A row is only read when its cells
+    fill the header's columns exactly; anything else cannot be aligned with the years."""
+    rejected = [] if rejected is None else rejected
     out: list[Series] = []
+
+    def points(columns: list[int | None], values: list[float]) -> list[tuple[int, float]]:
+        return [(y, v) for y, v in zip(columns, values) if y is not None]
+
     i = 0
     while i < len(lines):
         years = _is_year_line(lines[i])
@@ -332,33 +448,44 @@ def _tables(lines: list[str]) -> list[Series]:
         if not years or len(years) < 2 or len(set(years)) != len(years):
             i += 1
             continue
-        n = len(years)
+        columns: list[int | None] = list(years) if j > i + 1 else _header_columns(lines[i])
+        n = len(columns)
+        if sum(c is not None for c in columns) < 2:
+            i = j
+            continue
         k = j
         rows_seen = 0
         # Label printed above a one-year-per-line header, values below it: the label precedes the header
         cells, after = _numeric_cells(lines, k, n)
         if len(cells) == n and i > 0 and _has_text(lines[i - 1]) and not NUM_RE.search(lines[i - 1]):
-            out.append(Series(lines[i - 1], _unit_from_label(lines[i - 1]), list(zip(years, cells)),
+            out.append(Series(lines[i - 1], _unit_from_label(lines[i - 1]), points(columns, cells),
                               " ".join(lines[i - 1:after])))
             rows_seen += 1
             k = after
         while k < len(lines) and rows_seen < 25:
             line = lines[k]
-            if _is_year_line(line):
-                break
+            if _is_year_line(line) or _is_prose(line):
+                break  # the header above says nothing about what follows
             nums = [m.group(1) for m in NUM_RE.finditer(line)]
             label_part = NUM_RE.sub("", line).strip(" |:-–")
-            if len(nums) >= n and _has_text(label_part):
-                vals = [parse_number(x) for x in nums[-n:]]
-                if all(v is not None for v in vals) and not all(re.fullmatch(r"(?:19|20)\d{2}", x) for x in nums[-n:]):
-                    out.append(Series(label_part, _unit_from_label(label_part), list(zip(years, vals)), line))
-                    rows_seen += 1
-                k += 1
-                continue
+            if _has_text(label_part) and nums:
+                raw, label, cell_unit, seen = _row_cells(line, n)
+                label = label.strip(" |:-–")
+                if raw is not None and _has_text(label) and len(label.split()) <= MAX_ROW_LABEL_WORDS:
+                    vals = [parse_number(x) for x in raw]
+                    if all(v is not None for v in vals) and not all(re.fullmatch(r"(?:19|20)\d{2}", x) for x in raw):
+                        out.append(Series(label, _unit_from_label(label) or cell_unit, points(columns, vals), line))
+                        rows_seen += 1
+                    k += 1
+                    continue
+                if seen >= 2 and _has_text(label) and len(label.split()) <= MAX_ROW_LABEL_WORDS:
+                    rejected.append(Series(label, None, [], line, meta={"reason": f"{seen}_values_for_{n}_columns"}))
+                    k += 1
+                    continue
             if _has_text(line) and not nums:
                 cells, after = _numeric_cells(lines, k + 1, n)
                 if len(cells) == n:
-                    out.append(Series(line, _unit_from_label(line), list(zip(years, cells)), " ".join(lines[k:after])))
+                    out.append(Series(line, _unit_from_label(line), points(columns, cells), " ".join(lines[k:after])))
                     rows_seen += 1
                     k = after
                     continue

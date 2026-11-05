@@ -7,6 +7,8 @@ import httpx
 
 from app.core.config import get_settings
 from app.services.search.base import NullSearchProvider, SearchProvider, SearchResult
+from app.services.security.policy import run_bounded
+from app.services.security.safe_fetch import bounded_timeout
 
 log = logging.getLogger(__name__)
 
@@ -20,10 +22,16 @@ class DDGSSearchProvider(SearchProvider):
                 from ddgs import DDGS
             except ImportError:  # older package name
                 from duckduckgo_search import DDGS  # type: ignore
-            with DDGS() as ddgs:
-                rows = list(ddgs.text(query, max_results=max_results) or [])
+            settings = get_settings()
+
+            def _search() -> list[dict]:
+                with DDGS(timeout=int(settings.http_read_timeout_seconds)) as ddgs:
+                    return list(ddgs.text(query, max_results=max_results) or [])
+
+            rows = run_bounded(_search, settings.max_source_processing_seconds)
         except Exception as exc:  # noqa: BLE001
-            log.warning("DDGS search failed for %r: %s", query, exc)
+            self.failed_searches += 1
+            log.warning("search_failed: provider=ddgs error=%s", type(exc).__name__)
             return []
         return [
             SearchResult(title=r.get("title", ""), url=r.get("href") or r.get("url", ""), snippet=r.get("body", ""), query=query)
@@ -43,12 +51,15 @@ class SerpAPISearchProvider(SearchProvider):
             resp = httpx.get(
                 "https://serpapi.com/search.json",
                 params={"q": query, "api_key": self.api_key, "num": max_results, "engine": "google"},
-                timeout=get_settings().http_timeout_seconds,
+                timeout=bounded_timeout(),
+                trust_env=False,
             )
             resp.raise_for_status()
             rows = resp.json().get("organic_results", [])
         except Exception as exc:  # noqa: BLE001
-            log.warning("SerpAPI search failed for %r: %s", query, exc)
+            self.failed_searches += 1
+            # never the exception text: httpx errors contain the request URL, including the API key
+            log.warning("search_failed: provider=serpapi error=%s", type(exc).__name__)
             return []
         return [
             SearchResult(title=r.get("title", ""), url=r.get("link", ""), snippet=r.get("snippet", ""), query=query)
@@ -58,7 +69,10 @@ class SerpAPISearchProvider(SearchProvider):
 
 
 def get_search_provider() -> SearchProvider:
+    """Search providers receive company names and query terms, never document content."""
     settings = get_settings()
+    if not settings.enable_web_search:
+        return NullSearchProvider()
     name = settings.search_provider.lower()
     if name == "ddgs":
         return DDGSSearchProvider()

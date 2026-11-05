@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ class LlamaCppProvider(LLMProvider):
         self._llm = None
         self._lock = threading.Lock()
         self._load_error: str | None = None
+        self._timed_out = False  # True after a timeout; prevents concurrent use of stuck context
 
     @property
     def model_name(self) -> str | None:
@@ -71,15 +73,53 @@ class LlamaCppProvider(LLMProvider):
         return self._llm
 
     def complete_json(self, system: str, user: str, schema: dict[str, Any] | None = None, max_tokens: int = 384) -> str:
-        with self._lock:  # llama.cpp contexts are not thread-safe
+        """Generate a JSON completion.
+
+        Uses streaming (stream=True) so the timeout is checked at every token boundary.
+        When the deadline is reached the generator is closed — no further C++ computation
+        is queued, so inference truly stops at the next token handoff rather than leaving
+        an orphaned thread running to max_tokens.
+        """
+        from app.core.config import get_settings
+
+        timeout = get_settings().llm_timeout_seconds
+
+        with self._lock:  # llama.cpp contexts are not thread-safe; only one call at a time
+            if self._timed_out:
+                raise LLMUnavailableError(
+                    "LLM timed out on a previous call; using heuristic fallback for this assessment."
+                )
             llm = self._get()
             response_format: dict[str, Any] = {"type": "json_object"}
             if schema:
                 response_format["schema"] = schema
-            out = llm.create_chat_completion(
+
+            # stream=True yields one token per next() call so we can check the deadline
+            # between tokens.  gen.close() stops the Python generator; the C++ side has
+            # already returned from the previous token decode, so no orphaned inference.
+            gen = llm.create_chat_completion(
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
                 temperature=0.0,
                 max_tokens=max_tokens,
                 response_format=response_format,
+                stream=True,
             )
-        return out["choices"][0]["message"]["content"] or ""
+            deadline = time.monotonic() + timeout
+            parts: list[str] = []
+            try:
+                for chunk in gen:
+                    if time.monotonic() > deadline:
+                        gen.close()
+                        self._timed_out = True
+                        log.error("LlamaCpp: inference timed out after %ss", timeout)
+                        raise LLMUnavailableError(f"LLM call timed out after {timeout}s")
+                    content = (chunk["choices"][0].get("delta") or {}).get("content") or ""
+                    if content:
+                        parts.append(content)
+            except LLMUnavailableError:
+                raise
+            except Exception as exc:
+                raise LLMUnavailableError(f"LLM inference error: {exc}") from exc
+
+            self._timed_out = False  # clear so a transient hang doesn't permanently disable the LLM
+        return "".join(parts)

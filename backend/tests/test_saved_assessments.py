@@ -8,6 +8,7 @@ import uuid
 
 import pytest
 
+from app.core.config import get_settings
 from app.services.company.identify import normalize_company_name, normalize_org_number
 from app.services.llm.factory import set_llm_provider
 from tests.conftest import FakeLLM
@@ -89,7 +90,8 @@ def test_duplicate_completed_assessment_requires_confirmation(client):
     assert _lookup(client, name)["completed"]["id"] == new["id"]
 
 
-def test_rerun_creates_new_version_and_archives_previous(client):
+def test_rerun_creates_new_version_and_archives_previous(client, monkeypatch):
+    monkeypatch.setattr(get_settings(), "coverage_min_valid_sources", 0)  # these runs have no sources: treat that as reviewed
     name = _name()
     a = _analyse(client, name)
     recs = client.get(f"/api/assessments/{a['id']}/recommendations").json()
@@ -151,7 +153,8 @@ def test_org_number_and_country_prevent_wrong_merges(client):
     assert _lookup(client, name, organisation_number="556000-0001", country="Norway")["found"] is False
 
 
-def test_analyst_approval_and_override(client):
+def test_analyst_approval_and_override(client, monkeypatch):
+    monkeypatch.setattr(get_settings(), "coverage_min_valid_sources", 0)  # these runs have no sources: treat that as reviewed
     a = _analyse(client, _name())
     recs = client.get(f"/api/assessments/{a['id']}/recommendations").json()
     assert all(r["review_state"] == "no_evidence" for r in recs)  # nothing reviewed -> all gaps
@@ -167,8 +170,8 @@ def test_analyst_approval_and_override(client):
 
 def test_no_technical_metadata_in_analyst_endpoints(client, sample_pdf):
     set_llm_provider(FakeLLM())
-    name = _name("Nordvik")
-    r = client.post("/api/assessments", json={"company_name": name, "year": 2026, "enable_web_search": False})
+    name = "Nordvik Components AB"  # the company the sample report is about
+    r = client.post("/api/assessments", json={"company_name": name, "year": 2026, "enable_web_search": False, "confirm_new": True})
     aid = r.json()["id"]
     with open(sample_pdf, "rb") as f:
         client.post(f"/api/assessments/{aid}/documents", files={"file": ("report.pdf", f, "application/pdf")})

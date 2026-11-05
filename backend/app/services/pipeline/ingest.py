@@ -23,9 +23,10 @@ def _looks_like_table_page(text: str) -> bool:
     return len(set(YEAR_RE.findall(text))) >= 2 and len(re.findall(r"\d+(?:[.,]\d+)?", text)) >= 12
 
 
-def ingest_pdf(db: Session, source: Source, path: Path) -> Document:
+def ingest_pdf(db: Session, source: Source, pdf: Path | str | bytes, *, deadline: float | None = None) -> Document:
+    """`pdf` is a stored file (uploads) or in-memory bytes (external PDFs, which are not kept)."""
     settings = get_settings()
-    extracted = extract_pdf(path)
+    extracted = extract_pdf(pdf, deadline=deadline)
     doc = Document(source_id=source.id, title=extracted.title or source.title, doc_kind="pdf",
                    page_count=extracted.page_count, report_year=extracted.report_year, ocr_required=extracted.ocr_required)
     db.add(doc)
@@ -37,7 +38,7 @@ def ingest_pdf(db: Session, source: Source, path: Path) -> Document:
 
     # pdfplumber only for table-like pages the text parser could not structure
     table_pages = [p.page_number for p in extracted.pages if _looks_like_table_page(p.text) and not extract_series(p.text)]
-    tables = extract_tables_as_text(path, table_pages[:MAX_TABLE_PAGES]) if table_pages else {}
+    tables = extract_tables_as_text(pdf, table_pages[:MAX_TABLE_PAGES], deadline=deadline) if table_pages else {}
 
     page_texts: list[tuple[int | None, str]] = []
     for p in extracted.pages:
