@@ -46,10 +46,9 @@ async def lifespan(app: FastAPI):
     load_rules()  # fail fast on a broken questionnaire config
     _recover_interrupted_runs()
     s = get_settings()
-    log.info("Security configuration: restricted_mode=%s web_search=%s external_fetch=%s http_allowed=%s "
-             "store_external_files=%s domain_allowlist=%d",
-             s.bank_safe_mode, s.enable_web_search, s.enable_external_fetch, s.http_allowed,
-             s.store_external_files, len(s.allowed_domains))
+    log.info("Security configuration: restricted_mode=%s web_search=%s external_fetch=%s "
+             "max_download_mb=%d max_redirects=%d external_files_stored=False",
+             s.bank_safe_mode, s.enable_web_search, s.enable_external_fetch, s.max_download_mb, s.max_redirects)
     if s.enable_playwright:
         log.warning("ENABLE_PLAYWRIGHT is set, but this version contains no browser fetcher: it has no effect.")
     st = get_llm_provider().status()  # never raises: a missing model must not stop the app

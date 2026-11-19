@@ -12,12 +12,10 @@ T = TypeVar("T")
 # URL policy
 UNSAFE_URL = "unsafe_url"
 UNSAFE_SCHEME = "unsafe_scheme"
-HTTP_NOT_ALLOWED = "http_not_allowed"
 CREDENTIALS_IN_URL = "credentials_in_url"
 UNSAFE_HOST = "unsafe_host"
 UNSAFE_PORT = "unsafe_port"
 PRIVATE_IP = "private_ip"
-DOMAIN_NOT_ALLOWED = "domain_not_allowed"
 EXTERNAL_FETCH_DISABLED = "external_fetch_disabled"
 # Redirects
 TOO_MANY_REDIRECTS = "too_many_redirects"
@@ -41,7 +39,6 @@ AVAILABILITY_CODES = frozenset({DNS_RESOLUTION_FAILED, SOURCE_TIMEOUT, NETWORK_E
 _AUDIT_EVENTS = {
     UNSAFE_URL: "unsafe_url_rejected",
     UNSAFE_SCHEME: "unsafe_url_rejected",
-    HTTP_NOT_ALLOWED: "unsafe_url_rejected",
     CREDENTIALS_IN_URL: "unsafe_url_rejected",
     UNSAFE_HOST: "unsafe_url_rejected",
     UNSAFE_PORT: "unsafe_url_rejected",

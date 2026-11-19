@@ -1,5 +1,6 @@
-"""Restricted security mode: URL/SSRF policy, redirects, content validation, PDF handling, manual-upload
-mode, logging. Deterministic: DNS and HTTP are mocked, nothing ever connects anywhere."""
+"""Web access and security: normal public HTTP/HTTPS access, basic SSRF protection (also after redirects),
+bounded fetching, in-memory-only handling of retrieved documents, manual-upload mode, logging.
+Deterministic: DNS and HTTP are mocked, nothing ever connects anywhere."""
 from __future__ import annotations
 
 import gzip
@@ -95,8 +96,7 @@ def make_pdf(pages: int) -> bytes:
     "http://localhost/", "http://127.0.0.1/", "http://10.0.0.1/", "http://192.168.1.1/", "http://172.16.0.1/",
     "http://169.254.169.254/",
 ])
-def test_internal_http_urls_rejected_even_when_http_is_allowed(url, dns, configure):
-    configure(allow_http=True)
+def test_internal_http_urls_rejected(url, dns):
     with pytest.raises(UnsafeURLError) as e:
         validate_external_url(url)
     assert e.value.code in (policy.PRIVATE_IP, policy.UNSAFE_HOST)
@@ -203,18 +203,22 @@ def test_dns_failure_is_unavailability_not_a_security_rejection(monkeypatch):
     assert not policy.is_security_rejection(e.value.code)
 
 
-def test_domain_allowlist_is_configuration_driven(dns, configure):
-    configure(allowed_external_domains="Example.com, sec.gov")
-    assert validate_external_url("https://example.com/")
-    assert validate_external_url("https://www.sec.gov/")
-    for url in ("https://other.com/", "https://notexample.com/", "https://example.com.evil.org/"):
-        with pytest.raises(UnsafeURLError) as e:
-            validate_external_url(url)
-        assert e.value.code == policy.DOMAIN_NOT_ALLOWED
-    configure(allowed_domains_include_subdomains=False)
-    with pytest.raises(UnsafeURLError):
-        validate_external_url("https://www.sec.gov/")
-    assert validate_external_url("https://sec.gov/")
+@pytest.mark.parametrize("url", [
+    "https://www.swedbank.com/sustainability.html", "https://www.home.sandvik/en/", "https://assets.site.ingka.com/report.pdf",
+    "https://mb.cision.com/Main/1/2/report.pdf", "https://www.sec.gov/Archives/x.htm", "http://www.example.co.uk/",
+])
+def test_normal_public_hosts_accepted_without_any_allowlist(url, dns):
+    assert validate_external_url(url).addresses == (PUBLIC_IP,)
+
+
+def test_normal_public_https_company_page_is_fetched_and_text_extracted(dns):
+    from app.services.documents.html_extractor import extract_html
+
+    with client_for(lambda r: httpx.Response(200, headers={"content-type": "text/html; charset=utf-8"}, content=HTML)) as client:
+        res = fetch("https://www.company.example/sustainability", client=client)
+    assert res.kind == "html" and res.final_url == "https://www.company.example/sustainability"
+    content = extract_html(res.content, res.final_url)
+    assert content.title == "Sustainability" and "sustainability work continues" in content.text
 
 
 def test_rejected_url_never_reaches_the_network(dns):
@@ -278,7 +282,9 @@ def test_dns_rebinding_cannot_redirect_the_connection(dns, monkeypatch):
     ("https://resolves-private.example/", policy.PRIVATE_IP),
     ("https://localhost/", policy.UNSAFE_HOST),
     ("file:///etc/passwd", policy.UNSAFE_SCHEME),
-    ("http://public.example/downgrade", policy.HTTP_NOT_ALLOWED),
+    ("http://127.0.0.1/", policy.PRIVATE_IP),
+    ("http://localhost/admin", policy.UNSAFE_HOST),
+    ("http://metadata.google.internal/computeMetadata/v1/", policy.UNSAFE_HOST),
 ])
 def test_unsafe_redirect_targets_rejected(location, code, dns):
     dns["resolves-private.example"] = ["192.168.5.5"]
@@ -295,12 +301,55 @@ def test_unsafe_redirect_targets_rejected(location, code, dns):
     assert len(requests) == 1  # the target itself was never requested
 
 
-def test_redirect_outside_allowlist_rejected(dns, configure):
-    configure(allowed_external_domains="public.example")
-    with client_for(lambda r: httpx.Response(302, headers={"location": "https://elsewhere.example/"})) as client, \
-            pytest.raises(FetchError) as e:
-        fetch("https://public.example/", client=client)
-    assert e.value.code == policy.DOMAIN_NOT_ALLOWED
+def test_legitimate_redirects_to_other_public_hosts_are_followed(dns):
+    """http -> https, landing page -> corporate CDN / filing host: all normal for report links."""
+    hops = []
+
+    def handler(request):
+        hops.append(f"{request.url.scheme}://{request.headers['host']}{request.url.path}")
+        if request.headers["host"] == "company.example":
+            return httpx.Response(301, headers={"location": "https://www.company.example/reports/2025"})
+        if request.url.path == "/reports/2025":
+            return httpx.Response(302, headers={"location": "https://cdn.company-assets.example/files/ar-2025.pdf"})
+        return pdf_response()
+
+    with client_for(handler) as client:
+        res = fetch("http://company.example/report", client=client)
+    assert res.kind == "pdf" and res.final_url == "https://cdn.company-assets.example/files/ar-2025.pdf"
+    assert hops == ["http://company.example/report", "https://www.company.example/reports/2025",
+                    "https://cdn.company-assets.example/files/ar-2025.pdf"]
+
+
+def test_default_redirect_limit_allows_five_hops(dns):
+    assert get_settings().max_redirects == 5
+
+    def handler(request):
+        n = int(request.url.path.strip("/") or 0)
+        return httpx.Response(302, headers={"location": f"/{n + 1}"}) if n < 5 else httpx.Response(
+            200, headers={"content-type": "text/html"}, content=HTML)
+
+    with client_for(handler) as client:
+        assert fetch("https://public.example/", client=client).final_url == "https://public.example/5"
+
+
+def test_cookies_are_kept_along_one_redirect_chain_and_cleared_after(dns):
+    """Some report hosts set a cookie on the first hop and require it on the next."""
+    def handler(request):
+        if request.url.path == "/start":
+            return httpx.Response(302, headers={"location": "/doc", "set-cookie": "consent=1; Path=/"})
+        if "consent=1" not in request.headers.get("cookie", ""):
+            return httpx.Response(403)
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=HTML)
+
+    with client_for(handler) as client:
+        assert fetch("https://public.example/start", client=client).kind == "html"
+        assert not client.cookies
+
+
+@pytest.mark.parametrize("status", [200, 203])
+def test_any_success_status_is_accepted(status, dns):
+    with client_for(lambda r: httpx.Response(status, headers={"content-type": "text/html"}, content=HTML)) as client:
+        assert fetch("https://public.example/", client=client).kind == "html"
 
 
 def test_redirect_chain_over_limit_rejected(dns, configure):
@@ -339,19 +388,31 @@ def test_redirects_are_never_followed_by_the_http_client():
 
 
 # ---------------------------------------------------------------- content
-def test_pdf_url_returning_html_rejected(dns):
-    with client_for(lambda r: httpx.Response(200, headers={"content-type": "text/html"}, content=HTML)) as client, \
-            pytest.raises(FetchError) as e:
-        fetch("https://public.example/report.pdf", client=client)
-    assert e.value.code == policy.INVALID_CONTENT_TYPE
+def test_pdf_url_returning_html_is_read_as_the_page_it_is(dns):
+    """A ".pdf" link that lands on an HTML page (landing page, viewer) is not a security event."""
+    with client_for(lambda r: httpx.Response(200, headers={"content-type": "text/html"}, content=HTML)) as client:
+        res = fetch("https://public.example/report.pdf", client=client)
+    assert res.kind == "html"
 
 
-@pytest.mark.parametrize("ctype", ["application/pdf", "application/octet-stream"])
-def test_pdf_claim_with_wrong_bytes_rejected(ctype, dns):
-    with client_for(lambda r: httpx.Response(200, headers={"content-type": ctype}, content=b"<html>not a pdf</html>")) as client, \
+def test_declared_pdf_with_wrong_bytes_rejected(dns):
+    with client_for(lambda r: httpx.Response(200, headers={"content-type": "application/pdf"}, content=b"<html>not a pdf</html>")) as client, \
             pytest.raises(FetchError) as e:
         fetch("https://public.example/report.pdf", client=client)
     assert e.value.code == policy.INVALID_PDF_SIGNATURE
+
+
+@pytest.mark.parametrize("ctype", ["application/octet-stream", "binary/octet-stream", "application/force-download",
+                                   "application/x-download", ""])
+def test_download_endpoint_with_generic_type_is_recognised_by_its_bytes(ctype, dns):
+    """e.g. /download?id=123 served as octet-stream or with no type at all."""
+    headers = {"content-type": ctype} if ctype else {}
+    with client_for(lambda r: httpx.Response(200, headers=headers, content=PDF_BYTES)) as client:
+        assert fetch("https://ir.company.example/download?id=123", client=client).kind == "pdf"
+    with client_for(lambda r: httpx.Response(200, headers=headers, content=b"MZ\x90\x00binary")) as client, \
+            pytest.raises(FetchError) as e:
+        fetch("https://ir.company.example/download?id=124", client=client)
+    assert e.value.code == policy.INVALID_CONTENT_TYPE
 
 
 @pytest.mark.parametrize("body", [b"", b"%PD", b"%PDF"])
@@ -361,27 +422,19 @@ def test_empty_or_truncated_pdf_rejected(body, dns):
     assert e.value.code == policy.INVALID_PDF_SIGNATURE
 
 
-def test_redirect_from_pdf_url_keeps_pdf_expectations(dns):
-    def handler(request, body=PDF_BYTES, ctype="application/octet-stream"):
+def test_redirect_from_pdf_url_to_download_endpoint(dns):
+    def handler(request):
         if request.url.path == "/report.pdf":
             return httpx.Response(302, headers={"location": "/download?id=7"})
-        return httpx.Response(200, headers={"content-type": ctype}, content=body)
+        return httpx.Response(200, headers={"content-type": "application/octet-stream"}, content=PDF_BYTES)
 
     with client_for(handler) as client:
         assert fetch("https://public.example/report.pdf", client=client).kind == "pdf"
-    with client_for(lambda r: handler(r, HTML, "text/html")) as client, pytest.raises(FetchError) as e:
-        fetch("https://public.example/report.pdf", client=client)
-    assert e.value.code == policy.INVALID_CONTENT_TYPE
 
 
-def test_redirect_to_pdf_url_returning_html_rejected(dns):
-    def handler(request):
-        if request.url.path == "/start":
-            return httpx.Response(302, headers={"location": "/report.pdf"})
-        return httpx.Response(200, headers={"content-type": "text/html"}, content=HTML)
-
-    with client_for(handler) as client, pytest.raises(FetchError) as e:
-        fetch("https://public.example/start", client=client)
+def test_explicit_expectation_is_still_enforced(dns):
+    with client_for(lambda r: pdf_response()) as client, pytest.raises(FetchError) as e:
+        fetch("https://public.example/", expect="html", client=client)
     assert e.value.code == policy.INVALID_CONTENT_TYPE
 
 
@@ -392,7 +445,7 @@ def test_url_ending_in_pdf_alone_does_not_make_it_a_pdf(dns):
     assert e.value.code == policy.INVALID_CONTENT_TYPE
 
 
-@pytest.mark.parametrize("ctype", ["application/x-msdownload", "application/zip", "image/png", "text/javascript", ""])
+@pytest.mark.parametrize("ctype", ["application/x-msdownload", "application/zip", "image/png", "text/javascript"])
 def test_unrelated_content_types_rejected_without_reading_the_body(ctype, dns):
     def body():
         raise AssertionError("body must not be read")
@@ -610,23 +663,19 @@ def test_clean_scan_is_recorded(dns):
 
 
 # ---------------------------------------------------------------- configuration
-def test_restricted_mode_defaults():
+def test_security_defaults():
     s = Settings(_env_file=None)
     assert s.bank_safe_mode is True
-    assert s.http_allowed is False
-    assert s.store_external_files is False
     assert s.enable_playwright is False
-    assert s.max_redirects == 3 and s.max_download_mb == 20 and s.max_pdf_pages == 300
+    assert s.max_redirects == 5 and s.max_download_mb == 50 and s.max_pdf_pages == 500
+    assert s.http_connect_timeout_seconds > 0 and s.http_read_timeout_seconds > 0 and s.max_source_processing_seconds > 0
+    # there is no switch that stores automatically retrieved files, and no domain allowlist to maintain
+    for removed in ("store_downloaded_files", "allowed_external_domains", "allow_http", "download_dir"):
+        assert not hasattr(s, removed)
 
 
-def test_http_rejected_in_restricted_mode_unless_explicitly_allowed(dns, configure):
-    with pytest.raises(UnsafeURLError) as e:
-        validate_external_url("http://public.example/")
-    assert e.value.code == policy.HTTP_NOT_ALLOWED
-    configure(allow_http=True)
-    assert validate_external_url("http://public.example/")
-    configure(allow_http=False, bank_safe_mode=False)
-    assert validate_external_url("http://public.example/")
+def test_plain_http_public_url_allowed_in_restricted_mode(dns):
+    assert validate_external_url("http://public.example/").scheme == "http"
 
 
 def test_browser_automation_needs_explicit_enabling(configure, monkeypatch):
@@ -721,12 +770,14 @@ def test_full_pipeline_with_blocked_sources_continues_and_scores(client, dns, mo
     dns["private-host.nordvikcomponents.example"] = ["10.1.2.3"]
     good, redirecting, internal, plain_http = (
         f"{SITE}/sustainability-report-2025.pdf", f"{SITE}/moved-report-2025.pdf",
-        "https://private-host.nordvikcomponents.example/report-2025.pdf", "http://www.nordvikcomponents.example/report-2025.pdf",
+        "https://private-host.nordvikcomponents.example/report-2025.pdf", "http://www.nordvikcomponents.example/about",
     )
 
     def handler(request):
         if request.url.path == "/moved-report-2025.pdf":
             return httpx.Response(302, headers={"location": "http://169.254.169.254/latest/meta-data"})
+        if request.url.path == "/about":
+            return httpx.Response(200, headers={"content-type": "text/html"}, content=HTML)
         assert request.url.path == "/sustainability-report-2025.pdf"
         return pdf_response(pdf)
 
@@ -743,8 +794,9 @@ def test_full_pipeline_with_blocked_sources_continues_and_scores(client, dns, mo
     assert sources[good].status == "PROCESSED" and sources[good].fetch_outcome == "ok"
     assert sources[good].content_sha256 == content_validator.sha256_hex(pdf) and sources[good].bytes_downloaded == len(pdf)
     assert sources[good].file_path is None, "external PDFs are not stored"
-    assert sources[redirecting].status == "REJECTED" and sources[redirecting].fetch_outcome == policy.HTTP_NOT_ALLOWED
-    assert internal not in sources and plain_http not in sources  # refused before becoming a source
+    assert sources[redirecting].status == "REJECTED" and sources[redirecting].fetch_outcome == policy.PRIVATE_IP
+    assert internal not in sources  # refused before becoming a source
+    assert sources[plain_http].fetch_outcome == "ok"  # plain HTTP to a public host is normal access
     assert _stored_pdfs() == before
 
     # evidence and deterministic scoring still work, from the extracted text
@@ -757,9 +809,9 @@ def test_full_pipeline_with_blocked_sources_continues_and_scores(client, dns, mo
     # audit: technical reasons recorded
     events = _events(aid)
     types = {e.event_type for e in events}
-    assert {"redirect_rejected", "private_ip_rejected", "unsafe_url_rejected", "temporary_pdf_processed", "temporary_pdf_deleted"} <= types
+    assert {"redirect_rejected", "private_ip_rejected", "temporary_pdf_processed", "temporary_pdf_deleted"} <= types
     done = next(e for e in events if e.event_type == "web_discovery_completed")
-    assert done.details["sources_rejected"] == 1 and done.details["candidates_rejected"] == 2
+    assert done.details["sources_rejected"] == 1 and done.details["candidates_rejected"] == 1
 
     # analyst view: simple wording, no technical detail
     assert COVERAGE_LIMITED_MESSAGE in st["notices"]
@@ -842,26 +894,88 @@ def test_bytes_released_after_success(client, dns, monkeypatch, sample_pdf):
     assert results and all(r.content == b"" for r in results)
 
 
-def test_store_setting_cannot_override_restricted_mode(client, dns, monkeypatch, configure, sample_pdf):
-    configure(store_downloaded_files=True)
+@pytest.mark.parametrize("safe_mode", [True, False])
+def test_retrieved_pdfs_are_never_stored_in_any_mode(safe_mode, client, dns, monkeypatch, configure, sample_pdf):
+    configure(bank_safe_mode=safe_mode)
     _use_transport(monkeypatch, lambda r: pdf_response(sample_pdf.read_bytes()))
     before = _stored_pdfs()
     aid = _assessment(client)
     url = f"{SITE}/sustainability-report-2025.pdf"
     _run(client, aid, SpySearch([url]))
-    assert _sources(aid)[url].file_path is None
+    source = _sources(aid)[url]
+    assert source.status == "PROCESSED" and source.file_path is None
     assert _stored_pdfs() == before
+    rows = client.get(f"/api/assessments/{aid}/sources").json()
+    assert next(r for r in rows if r["url"] == url)["has_file"] is False
 
 
-def test_storage_is_opt_in_outside_restricted_mode(client, dns, monkeypatch, configure, sample_pdf):
-    configure(bank_safe_mode=False, store_downloaded_files=True)
-    _use_transport(monkeypatch, lambda r: pdf_response(sample_pdf.read_bytes()))
-    aid = _assessment(client)
-    url = f"{SITE}/sustainability-report-2025.pdf"
-    _run(client, aid, SpySearch([url]))
-    stored = Path(_sources(aid)[url].file_path)
-    assert stored.parent == get_settings().download_dir and stored.stem != "report"
-    stored.unlink()
+def test_public_pdf_is_fetched_and_extracted_without_writing_any_file(dns, monkeypatch, sample_pdf):
+    """Fetch, page text and table text all work from the in-memory bytes: no file is opened for writing,
+    no temporary file is created."""
+    import builtins
+    import io
+
+    from app.services.documents.tables import extract_tables_as_text
+
+    real_open = builtins.open
+
+    def guarded_open(file, mode="r", *a, **k):
+        if any(c in mode for c in "wax+"):
+            raise AssertionError(f"file opened for writing: {file}")
+        return real_open(file, mode, *a, **k)
+
+    def no_temp(*_a, **_k):
+        raise AssertionError("no temporary file may be created")
+
+    pdf = sample_pdf.read_bytes()
+    monkeypatch.setattr(builtins, "open", guarded_open)
+    monkeypatch.setattr(io, "open", guarded_open)
+    for name in ("NamedTemporaryFile", "TemporaryFile", "SpooledTemporaryFile", "mkstemp", "mkdtemp"):
+        monkeypatch.setattr(tempfile, name, no_temp)
+    monkeypatch.setattr(Path, "write_bytes", no_temp)
+    with client_for(lambda r: pdf_response(pdf)) as client:
+        res = fetch("https://cdn.company.example/files/report-2025.pdf", client=client)
+    document = extract_pdf(res.content)
+    extract_tables_as_text(res.content, [1])
+    assert res.kind == "pdf" and document.page_count > 0 and document.full_text.strip()
+
+
+def test_rejected_external_sources_cannot_affect_scoring(client, dns, monkeypatch, sample_pdf):
+    """Same good report, with and without a set of refused sources: identical recommendations."""
+    pdf = sample_pdf.read_bytes()
+    dns["intra.nordvikcomponents.example"] = ["192.168.1.20"]
+    good = f"{SITE}/sustainability-report-2025.pdf"
+    blocked = [f"{SITE}/to-metadata-2025.pdf", f"{SITE}/to-localhost-2025.pdf",
+               "https://intra.nordvikcomponents.example/sustainability-report-2025.pdf", "http://127.0.0.1/report-2025.pdf"]
+
+    def handler(request):
+        if request.url.path == "/to-metadata-2025.pdf":
+            return httpx.Response(302, headers={"location": "http://169.254.169.254/latest/meta-data"})
+        if request.url.path == "/to-localhost-2025.pdf":
+            return httpx.Response(302, headers={"location": "http://localhost/admin"})
+        return pdf_response(pdf)
+
+    _use_transport(monkeypatch, handler)
+
+    def levels(urls):
+        aid = _assessment(client)
+        assert _run(client, aid, SpySearch(urls))["status"] == "COMPLETED"
+        recs = client.get(f"/api/assessments/{aid}/recommendations").json()
+        with SessionLocal() as db:
+            ev_urls = {e.source_url for e in db.scalars(select(Evidence).where(Evidence.assessment_id == aid))}
+        return {(r["factor"], r["dimension"]): r["recommended_level"] for r in recs}, ev_urls
+
+    clean, clean_urls = levels([good])
+    noisy, noisy_urls = levels([good, *blocked])
+    # refused sources contribute no evidence
+    assert noisy_urls <= clean_urls | {None} and not set(blocked) & noisy_urls
+    # every evidence-backed level is identical
+    assert clean.keys() == noisy.keys()
+    assert {k: v for k, v in clean.items() if v > 1} == {k: v for k, v in noisy.items() if v > 1}
+    assert any(v > 1 for v in clean.values())
+    # the only allowed difference is the existing coverage rule: with refused sources a gap is shown as
+    # "not assessed" (0), never as a Level 1 finding of absent activity
+    assert all(clean[k] == 1 and noisy[k] == 0 for k in clean if clean[k] != noisy[k])
 
 
 def test_malformed_links_in_a_page_do_not_stop_the_assessment(client, dns, monkeypatch):

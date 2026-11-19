@@ -1,5 +1,6 @@
-"""Central URL and SSRF policy. Every external URL is validated here before any request is made,
-and again for every redirect target."""
+"""Basic SSRF protection. Every external URL is validated here before any request is made, and again
+for every redirect target. Normal public HTTP/HTTPS hosts are allowed; what is blocked is localhost,
+private, link-local, reserved and cloud-metadata destinations, and URLs that try to disguise them."""
 from __future__ import annotations
 
 import ipaddress
@@ -83,21 +84,11 @@ def resolve_host(host: str, port: int | None, scheme: str) -> tuple[str, ...]:
     return tuple(sorted(addresses, key=lambda a: ":" in a))
 
 
-def validate_domain_policy(host: str) -> None:
-    settings = get_settings()
-    allowed = settings.allowed_domains
-    if not allowed:
-        return
-    subdomains = settings.allowed_domains_include_subdomains
-    if not any(host == d or (subdomains and host.endswith("." + d)) for d in allowed):
-        raise UnsafeURLError(policy.DOMAIN_NOT_ALLOWED, f"Host {host!r} is not on the configured allowlist")
-
-
-def validate_external_url(url: str, *, resolve_dns: bool = True, enforce_domain_policy: bool = True) -> ValidatedURL:
+def validate_external_url(url: str, *, resolve_dns: bool = True) -> ValidatedURL:
     """Return the validated target or raise UnsafeURLError.
 
-    Checks scheme, credentials, hostname, port, IP literals, the optional domain allowlist and,
-    unless `resolve_dns` is off, every address the hostname resolves to."""
+    Checks scheme, credentials, hostname, port, IP literals and, unless `resolve_dns` is off, every
+    address the hostname resolves to. There is no domain allowlist: any public host is acceptable."""
     url = (url or "").strip()
     if not url or len(url) > MAX_URL_LENGTH or _UNSAFE_URL_CHARS.search(url):
         raise UnsafeURLError(policy.UNSAFE_URL, "URL missing, too long or containing forbidden characters")
@@ -111,10 +102,7 @@ def validate_external_url(url: str, *, resolve_dns: bool = True, enforce_domain_
     except ValueError as exc:  # includes UnicodeError
         raise UnsafeURLError(policy.UNSAFE_URL, "Malformed URL") from exc
     scheme = parsed.scheme.lower()
-    if scheme == "http":
-        if not get_settings().http_allowed:
-            raise UnsafeURLError(policy.HTTP_NOT_ALLOWED, "Plain HTTP is not allowed")
-    elif scheme != "https":
+    if scheme not in ("http", "https"):
         raise UnsafeURLError(policy.UNSAFE_SCHEME, f"Scheme not allowed: {scheme!r}")
     if parsed.username or parsed.password:
         raise UnsafeURLError(policy.CREDENTIALS_IN_URL, "Credentials in URL are not allowed")
@@ -135,8 +123,6 @@ def validate_external_url(url: str, *, resolve_dns: bool = True, enforce_domain_
         if (host in BLOCKED_HOSTNAMES or host.endswith(BLOCKED_SUFFIXES) or len(labels) < 2
                 or _NUMERIC_LAST_LABEL.match(labels[-1])):
             raise UnsafeURLError(policy.UNSAFE_HOST, f"Host not allowed: {host!r}")
-    if enforce_domain_policy:
-        validate_domain_policy(host)
 
     if literal is not None:
         addresses: tuple[str, ...] = (str(literal),)

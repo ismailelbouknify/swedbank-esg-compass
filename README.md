@@ -238,29 +238,31 @@ controlled environments. **It reduces technical risk but does not replace organi
 scanning required by the deployment environment.** Final deployment remains subject to organisational IT/security review.
 All settings are listed in `backend/.env.example`; the controls live in `backend/app/services/security/`.
 
-External content is always untrusted and is only ever parsed for text, never opened, rendered or executed:
+Web access follows one principle: **allow normal public HTTP/HTTPS access, extract text, and do not persist automatically
+retrieved external files.** Any public company website, CDN or filing host can be read without an allowlist; only localhost,
+private/internal, link-local and cloud-metadata destinations are blocked. External content is untrusted and is only ever
+parsed for text, never opened, rendered or executed:
 
 ```
-Search (if enabled) -> URL + DNS/IP validation -> domain allowlist -> bounded HTTPS request -> validate every redirect
-  -> content type + size checks
-       HTML: extract text
-       PDF:  %PDF- signature -> malware scan hook -> in-memory text extraction -> discard the PDF
+Search (if enabled) -> URL + DNS/IP check (no local/private targets) -> bounded request -> re-check every redirect
+  -> size checks; the bytes decide the type (%PDF- signature or HTML markup), not the URL or a generic header
+       HTML: extract text in memory
+       PDF:  malware scan hook -> text extraction from the in-memory bytes -> bytes discarded
   -> company/source validation -> retrieval -> evidence validation -> local LLM -> deterministic scoring
 ```
 
 | Control | Behaviour | Settings |
 | --- | --- | --- |
 | Manual upload only | No search and no retrieval requests are made; analyses use uploaded PDFs | `ENABLE_WEB_SEARCH=false`, `ENABLE_EXTERNAL_FETCH=false` |
-| URL policy | HTTPS only; no credentials, non-standard ports, local names or numeric host tricks | `ALLOW_HTTP` |
+| URL policy | HTTP and HTTPS to any public host; no credentials, non-standard ports, local names or numeric host tricks | |
 | Network targets | Every address a host resolves to must be public (private, loopback, link-local, metadata, multicast and reserved ranges are refused, for IPv4, IPv6 and IPv4 embedded in IPv6). The connection is pinned to the validated address | |
-| Domain allowlist | Optional; applies to every redirect hop too | `ALLOWED_EXTERNAL_DOMAINS`, `ALLOWED_DOMAINS_INCLUDE_SUBDOMAINS` |
-| Redirects | Followed one at a time, each validated like a new URL | `MAX_REDIRECTS` |
+| Redirects | Up to 5, to any public host (e.g. corporate site to CDN); each target is checked like a new URL, so a redirect cannot reach a local or internal address. Cookies last for one redirect chain | `MAX_REDIRECTS` |
 | Size and pages | Limit checked from `Content-Length` and again while streaming. Over-limit PDFs are rejected, not truncated; such a report can be reviewed, then uploaded manually if it fits the upload limits | `MAX_DOWNLOAD_MB`, `MAX_HTML_SIZE_MB`, `MAX_PDF_PAGES`, `MAX_PDF_SIZE_MB` (uploads) |
 | Time | Connect and read timeouts, a total limit per source, bounded retries with backoff | `HTTP_CONNECT_TIMEOUT_SECONDS`, `HTTP_READ_TIMEOUT_SECONDS`, `MAX_SOURCE_PROCESSING_SECONDS`, `MAX_HTTP_RETRIES` |
-| External PDFs | Held in memory only, released after text extraction, never written to disk or to the database. Only metadata and extracted text are kept. Storing them needs `BANK_SAFE_MODE=false` and `STORE_DOWNLOADED_FILES=true` | `STORE_DOWNLOADED_FILES` |
+| External PDFs and pages | Held in memory only, released after text extraction, never written to disk (no temporary files either) or to the database, in any mode. Only the URL, metadata, extracted text and evidence are kept | |
 | Uploads | PDF only: extension, content type, signature, size, page count, encryption. Stored under generated names | `MAX_PDF_SIZE_MB`, `MAX_PDF_PAGES` |
 | Local LLM | All retrieval, extraction, validation and scoring run locally. No cloud LLM exists in the code, and a non-local Ollama endpoint is refused in this mode | `LLM_PROVIDER`, `OLLAMA_BASE_URL` |
-| Web server | Answers only the configured Host names, sends security headers, no CDN-backed API docs | `ALLOWED_HOSTS` |
+| Web server | Answers only the configured Host names, sends security headers, no CDN-backed API docs. `BANK_SAFE_MODE` governs this and the local-LLM rule only, not web access | `ALLOWED_HOSTS` |
 
 A rejected or unavailable source never stops an assessment. It is recorded (`sources.status`, `sources.fetch_outcome`, audit
 events such as `private_ip_rejected`, `redirect_rejected`, `download_size_limit_exceeded`, `invalid_pdf_signature`) and the

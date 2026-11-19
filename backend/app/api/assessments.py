@@ -89,10 +89,9 @@ def create_assessment(body: AssessmentCreate, db: Session = Depends(get_db)) -> 
     website = normalize_website(body.website)
     if website:
         try:
-            validate_external_url(website, resolve_dns=False, enforce_domain_policy=False)
+            validate_external_url(website, resolve_dns=False)
         except UnsafeURLError as exc:
-            # the allowlist is applied when fetching: in itself it does not make a company invalid
-            raise HTTPException(422, "Invalid website: enter a public https:// address.") from exc
+            raise HTTPException(422, "Invalid website: enter a public web address.") from exc
     settings = get_settings()
     enable_web_search = body.enable_web_search and settings.enable_web_search and settings.enable_external_fetch
     existing = registry.current_matches(db, body.company_name, body.year, body.organisation_number, body.country)

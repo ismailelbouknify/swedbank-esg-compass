@@ -21,7 +21,9 @@ log = logging.getLogger(__name__)
 PDF_SIGNATURE = b"%PDF-"
 HTML_TYPES = ("text/html", "application/xhtml+xml")
 PDF_TYPES = ("application/pdf", "application/x-pdf")
-GENERIC_BINARY_TYPES = ("application/octet-stream", "binary/octet-stream")
+# Download endpoints and CDNs often serve reports under a generic type (or none): the bytes decide.
+GENERIC_BINARY_TYPES = ("", "application/octet-stream", "binary/octet-stream", "application/download",
+                        "application/x-download", "application/force-download", "application/unknown")
 
 
 class ContentRejected(SourceRejection):
@@ -77,15 +79,27 @@ def url_path_is_pdf(url: str) -> bool:
         return False
 
 
-def classify_content_type(content_type: str, pdf_expected: bool) -> str | None:
-    """'pdf', 'html' or None (not processed). A PDF claim is only a claim: the signature is checked too."""
+def classify_content_type(content_type: str) -> str | None:
+    """Declared type before the body is read: 'pdf', 'html', 'unknown' (generic; decided by the bytes)
+    or None (images, archives, media...: not processed, and not downloaded)."""
     if content_type in HTML_TYPES:
         return "html"
     if content_type in PDF_TYPES:
         return "pdf"
-    if content_type in GENERIC_BINARY_TYPES and pdf_expected:
-        return "pdf"
+    if content_type in GENERIC_BINARY_TYPES:
+        return "unknown"
     return None
+
+
+_HTML_MARKERS = (b"<!doctype html", b"<html", b"<head", b"<body")
+
+
+def sniff_kind(content: bytes) -> str | None:
+    """'pdf' or 'html' from the bytes themselves, or None. A PDF is only ever recognised by its signature."""
+    if content.startswith(PDF_SIGNATURE):
+        return "pdf"
+    head = content[:1024].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    return "html" if head.startswith(_HTML_MARKERS) or b"<html" in head else None
 
 
 def validate_pdf_signature(content: bytes) -> None:

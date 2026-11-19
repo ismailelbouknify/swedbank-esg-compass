@@ -720,7 +720,7 @@ def test_blocking_a_report_adds_no_model_calls_and_keeps_the_limits(client, web,
     from app.core.config import Settings
 
     defaults = Settings(_env_file=None)
-    assert defaults.max_pdf_pages == 300 and defaults.max_download_mb == 20
+    assert defaults.max_pdf_pages == 500 and defaults.max_download_mb == 50
     monkeypatch.setattr(get_settings(), "recovery_search_enabled", False)
     pages = _good_pages(web)
     plain, with_blocked = FakeLLM(), FakeLLM()

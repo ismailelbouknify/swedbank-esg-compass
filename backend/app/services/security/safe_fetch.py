@@ -1,5 +1,9 @@
-"""The only path for retrieving external documents: validated URLs, connections pinned to the validated
-IP, re-validated redirects, bounded time and size, content checks before anything is parsed."""
+"""The only path for retrieving external pages and documents.
+
+Normal public HTTP/HTTPS access with basic SSRF protection: every URL and every redirect target is checked
+against localhost/private/link-local/metadata destinations, and the connection goes to the address that
+was checked. Time, size and redirects are bounded. The response is held in memory only: nothing is written
+to disk, and the caller drops the bytes once text has been extracted."""
 from __future__ import annotations
 
 import time
@@ -15,7 +19,7 @@ from app.services.security.content_validator import (
     classify_content_type,
     enforce_scan,
     sha256_hex,
-    url_path_is_pdf,
+    sniff_kind,
 )
 from app.services.security.policy import SourceRejection
 from app.services.security.url_validator import UnsafeURLError, ValidatedURL, validate_external_url
@@ -84,6 +88,7 @@ def fetch(url: str, *, expect: str = "any", client: httpx.Client | None = None, 
             time.sleep(wait)
             attempt += 1
     finally:
+        client.cookies.clear()  # cookies live for one redirect chain only
         if own_client:
             client.close()
 
@@ -94,7 +99,8 @@ def _check_deadline(deadline: float) -> None:
 
 
 def _follow_redirects(client: httpx.Client, url: str, expect: str, deadline: float, settings: Settings) -> FetchResult:
-    expect_pdf = expect == "pdf" or url_path_is_pdf(url)
+    """Redirects to any public host are followed (corporate site -> CDN or filing host is normal);
+    each target is validated again, so a redirect can never reach a local or internal address."""
     current = url
     for hop in range(settings.max_redirects + 1):
         _check_deadline(deadline)
@@ -108,10 +114,9 @@ def _follow_redirects(client: httpx.Client, url: str, expect: str, deadline: flo
                 if resp.is_redirect:
                     current = urljoin(current, resp.headers["location"])
                     continue
-                return _read_body(resp, url, current, expect, expect_pdf, deadline, settings)
+                return _read_body(resp, url, current, expect, deadline, settings)
             finally:
                 resp.close()
-                client.cookies.clear()
         except SourceRejection:
             raise
         except httpx.TimeoutException as exc:
@@ -140,22 +145,20 @@ def _send_pinned(client: httpx.Client, target: ValidatedURL) -> httpx.Response:
     raise last_error or httpx.ConnectError("No address to connect to")
 
 
-def _read_body(resp: httpx.Response, url: str, current: str, expect: str, expect_pdf: bool, deadline: float,
+def _read_body(resp: httpx.Response, url: str, current: str, expect: str, deadline: float,
                settings: Settings) -> FetchResult:
-    if resp.status_code != 200:
+    if not 200 <= resp.status_code < 300:
         raise FetchError(policy.HTTP_ERROR, f"HTTP {resp.status_code}", retryable=resp.status_code in RETRYABLE_STATUS)
     content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
-    expect_pdf = expect_pdf or url_path_is_pdf(current)
-    kind = classify_content_type(content_type, expect_pdf)
-    if kind is None or (expect != "any" and kind != expect) or (expect_pdf and kind != "pdf"):
+    declared = classify_content_type(content_type)
+    if declared is None:  # image, archive, media...: not a document this tool reads, so not downloaded
         raise FetchError(policy.INVALID_CONTENT_TYPE, f"Unexpected content type {content_type!r}")
 
-    limit = settings.max_download_mb * 1024 * 1024
-    if kind == "html":
-        limit = min(limit, settings.max_html_size_mb * 1024 * 1024)
-    declared = resp.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > limit:
-        raise FetchError(policy.DOWNLOAD_SIZE_LIMIT_EXCEEDED, f"Declared size {declared} exceeds {limit} bytes")
+    html_limit = min(settings.max_download_mb, settings.max_html_size_mb) * 1024 * 1024
+    limit = html_limit if declared == "html" else settings.max_download_mb * 1024 * 1024
+    declared_size = resp.headers.get("content-length", "")
+    if declared_size.isdigit() and int(declared_size) > limit:
+        raise FetchError(policy.DOWNLOAD_SIZE_LIMIT_EXCEEDED, f"Declared size {declared_size} exceeds {limit} bytes")
 
     # Content-Length may be absent or wrong, and the limit applies to decoded bytes so that a
     # compressed response cannot expand past it unnoticed.
@@ -165,12 +168,22 @@ def _read_body(resp: httpx.Response, url: str, current: str, expect: str, expect
         if len(buffer) > limit:
             raise FetchError(policy.DOWNLOAD_SIZE_LIMIT_EXCEEDED, f"Response exceeds {limit} bytes")
         _check_deadline(deadline)
-        # stop reading as soon as the first bytes show this is not a PDF
-        if kind == "pdf" and not bytes(buffer[:len(PDF_SIGNATURE)]).startswith(PDF_SIGNATURE[:len(buffer)]):
+        # a declared PDF that does not start like one: stop reading now
+        if declared == "pdf" and not bytes(buffer[:len(PDF_SIGNATURE)]).startswith(PDF_SIGNATURE[:len(buffer)]):
             raise FetchError(policy.INVALID_PDF_SIGNATURE, "Content does not have a PDF signature")
     content = bytes(buffer)
-    if kind == "pdf" and not content.startswith(PDF_SIGNATURE):  # empty or truncated before the signature ended
+    del buffer
+    # The bytes decide what the document is, not the URL or a generic header: a ".pdf" link may land on an
+    # HTML page, and download endpoints serve PDFs as octet-stream. A PDF needs its signature.
+    kind = sniff_kind(content)
+    if declared == "html" and kind is None:
+        kind = "html"  # HTML fragments without an <html> tag are still pages
+    if declared == "pdf" and kind != "pdf":
         raise FetchError(policy.INVALID_PDF_SIGNATURE, "Content does not have a PDF signature")
+    if kind is None or (expect != "any" and kind != expect):
+        raise FetchError(policy.INVALID_CONTENT_TYPE, f"Unexpected content {content_type!r}")
+    if kind == "html" and len(content) > html_limit:
+        raise FetchError(policy.DOWNLOAD_SIZE_LIMIT_EXCEEDED, f"Page exceeds {html_limit} bytes")
     digest = sha256_hex(content)
     try:
         scan_status = enforce_scan(content, kind=kind, sha256=digest)

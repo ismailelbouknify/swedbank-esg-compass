@@ -2,7 +2,6 @@
 Never crawls a whole site."""
 from __future__ import annotations
 
-import hashlib
 import logging
 import time
 from collections import Counter
@@ -110,13 +109,6 @@ def _well_formed(url: str) -> bool:
         return False
 
 
-def _save_pdf(content: bytes, url: str) -> str:
-    name = hashlib.sha256(url.encode()).hexdigest()[:24] + ".pdf"
-    path = get_settings().download_dir / name
-    path.write_bytes(content)
-    return str(path)
-
-
 def _new_source(db: Session, a: Assessment, url: str, title: str, source_type: str, official: bool, via: str) -> Source:
     pr = source_priority(source_type)
     s = Source(assessment_id=a.id, source_type=source_type, priority=pr["priority"], title=title[:500] if title else None,
@@ -154,16 +146,15 @@ def _mark_unprocessed(db: Session, s: Source, exc: SourceRejection, report: Disc
 
 
 def _process_pdf(db: Session, s: Source, res: FetchResult, report: DiscoveryReport, deadline: float) -> None:
-    """Text extraction from the in-memory PDF; afterwards the original bytes are released."""
+    """Text extraction straight from the in-memory PDF bytes. An automatically retrieved PDF is never
+    written to disk or to the database; only its URL, metadata and extracted text are kept, and the bytes
+    are released as soon as extraction is over, whatever its outcome."""
     started = time.monotonic()
-    stored = get_settings().store_external_files
     try:
-        if stored:
-            s.file_path = _save_pdf(res.content, res.final_url)
         document = ingest_pdf(db, s, res.content, deadline=deadline)
         log_event(db, "temporary_pdf_processed", assessment_id=s.assessment_id, entity_type="source", entity_id=s.id,
                   details={"bytes": res.size, "pages": document.page_count, "sha256": res.sha256, "scan": res.scan_status,
-                           "seconds": round(time.monotonic() - started, 2), "stored": stored})
+                           "seconds": round(time.monotonic() - started, 2), "stored": False})
     except SourceRejection as exc:
         _mark_unprocessed(db, s, exc, report)
         if exc.code == policy.PDF_PAGE_LIMIT_EXCEEDED:
@@ -174,9 +165,8 @@ def _process_pdf(db: Session, s: Source, res: FetchResult, report: DiscoveryRepo
         _mark_unprocessed(db, s, SourceRejection(policy.PDF_PARSE_FAILED, f"PDF could not be read: {type(exc).__name__}"), report)
     finally:
         res.content = b""
-        if not stored:
-            log_event(db, "temporary_pdf_deleted", assessment_id=s.assessment_id, entity_type="source", entity_id=s.id,
-                      details={"storage": "memory"})
+        log_event(db, "temporary_pdf_deleted", assessment_id=s.assessment_id, entity_type="source", entity_id=s.id,
+                  details={"storage": "memory"})
 
 
 def _download_into(db: Session, s: Source, report: DiscoveryReport, expect: str = "any") -> FetchResult | None:
