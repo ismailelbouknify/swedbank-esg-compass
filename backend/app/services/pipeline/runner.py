@@ -7,8 +7,11 @@ Runs in a background thread (FastAPI BackgroundTasks); progress is persisted on 
 Assessment row so the UI can poll /status."""
 from __future__ import annotations
 
+import hashlib
 import logging
+import time
 import traceback
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -26,6 +29,7 @@ from app.services.company.identify import normalize_company_name
 from app.services.company.resolution import AMBIGUOUS
 from app.services.company.source_identity import SOURCE_COMPANY_MISMATCH
 from app.services.documents.url_safety import registrable_domain
+from app.services.extraction import patterns as P
 from app.services.extraction.extractor import Candidate, FactExtractor, Passage, passage_signal
 from app.services.llm.base import LLM_NOT_CONFIGURED_MESSAGE, LLMProvider
 from app.services.llm.factory import get_llm_provider
@@ -63,6 +67,8 @@ EXTERNAL_ACCESS_OFF_MESSAGE = ("Automatic search and retrieval of public sources
                                "Upload the sustainability report to include it in the analysis.")
 COMPANY_MISMATCH_MESSAGE = ("One or more documents did not appear to concern the assessed company and were not used. "
                             "Check that the right report and company name were given.")
+BUDGET_GAP_REASON = ("Insufficient source coverage \u2014 not every relevant passage could be analysed within this assessment's "
+                     "processing limit, so no conclusion was drawn.")
 COVERAGE_LIMITED_MESSAGE = ("Some public sources could not be processed, so a gap in this assessment may reflect an "
                             "unavailable source rather than missing company activity.")
 
@@ -91,6 +97,19 @@ class AssessmentRunner:
         self.recovery_runs = 0
         self.discovery_counts: dict[str, int] = {}
         self.discovery_queries: list[str] = []
+        self.stage_seconds: dict[str, float] = {}
+        self.llm_calls = 0
+        self.llm_seconds = 0.0
+        self.duplicate_passages = 0
+
+    @contextmanager
+    def _timed(self, stage: str):
+        """Wall time per pipeline stage, kept in the audit metrics: where an assessment spends its time."""
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.stage_seconds[stage] = round(self.stage_seconds.get(stage, 0.0) + time.perf_counter() - started, 2)
 
     # ------------------------------------------------------------------ progress
     def _stage(self, idx: int, message: str | None = None, progress: float | None = None) -> None:
@@ -109,19 +128,31 @@ class AssessmentRunner:
         self.db.commit()
         try:
             self._identify()
-            self._search()
-            self._process_documents()
-            self._validate_source_identity()
-            retrieved = self._retrieve()
-            if self._recover_if_needed(retrieved[0]):
+            with self._timed("discovery"):
+                self._search()
+            with self._timed("document_processing"):
+                self._process_documents()
+            with self._timed("source_validation"):
                 self._validate_source_identity()
+            with self._timed("retrieval"):
                 retrieved = self._retrieve()
+            with self._timed("recovery"):
+                recovered = self._recover_if_needed(retrieved[0])
+                if recovered:
+                    self._validate_source_identity()
+            if recovered:
+                with self._timed("retrieval"):
+                    retrieved = self._retrieve()
             passages_by_q, all_passages, report_passages = retrieved
-            self.coverage = self._coverage(passages_by_q)
-            self._report_final_coverage()
-            candidates = self._extract(passages_by_q, all_passages, report_passages)
-            evidence = self._persist_evidence(candidates)
-            self._score(evidence)
+            with self._timed("coverage"):
+                self.coverage = self._coverage(passages_by_q)
+                self._report_final_coverage()
+            with self._timed("extraction"):
+                candidates = self._extract(passages_by_q, all_passages, report_passages)
+            with self._timed("grounding_validation"):
+                evidence = self._persist_evidence(candidates)
+            with self._timed("scoring"):
+                self._score(evidence)
             self._record_coverage_metrics(evidence)
             self._stage(6)
             a.status = "COMPLETED"
@@ -259,29 +290,38 @@ class AssessmentRunner:
         c["candidates_rejected"] = c.get("candidates_rejected", 0) + rep.candidates_rejected + rep.candidates_other_entity
         c["search_results_seen"] = c.get("search_results_seen", 0) + rep.results_seen
         c["searches_failed"] = c.get("searches_failed", 0) + rep.searches_failed
+        c["fetch_seconds"] = c.get("fetch_seconds", 0.0) + rep.fetch_seconds
+        c["pdf_parse_seconds"] = c.get("pdf_parse_seconds", 0.0) + rep.pdf_parse_seconds
+        c["duplicate_documents"] = c.get("duplicate_documents", 0) + rep.duplicate_documents
 
     def _coverage(self, by_q) -> CoverageCheck:
         """Uses only the cheap re-ranking signal on retrieved passages: no model call is needed to see a thin result."""
         factors = [f["key"] for f in self.rules["factors"]]
-        without = sum(not any(passage_signal(f, dim, p.text) > 0 for dim in FACTOR_DIMENSIONS for p in by_q.get((f, dim), [])) for f in factors)
-        return assess_coverage(self.db, self.a, self.settings, without, len(factors))
+        candidates = {f: sum(passage_signal(f, dim, p.text) > 0 for dim in FACTOR_DIMENSIONS for p in by_q.get((f, dim), [])) for f in factors}
+        without = sum(not n for n in candidates.values())
+        return assess_coverage(self.db, self.a, self.settings, without, len(factors), factor_candidates=candidates)
 
     def _recover_if_needed(self, by_q) -> bool:
-        """At most one recovery search, and only where a search was allowed in the first place."""
+        """At most one recovery search, and only where a search was allowed in the first place. It runs when the
+        sources as a whole are thin, or when a factor has neither enough coverage to say "no evidence" nor any
+        candidate passage; its queries then target those factors first."""
         settings = self.settings
         check = self._coverage(by_q)
+        weak = check.weak_factors([f["key"] for f in self.rules["factors"]])
         has_valid_upload = any(s.source_type == "uploaded_report" and s.status == "PROCESSED" for s in self.a.sources)
         # more searching cannot tell which company is meant: only the analyst can
         ambiguous = (self.a.company_identity or {}).get("status") == AMBIGUOUS
         allowed = (settings.recovery_search_enabled and self.a.enable_web_search and settings.enable_web_search
                    and settings.enable_external_fetch and not has_valid_upload and not ambiguous)
-        if not check.recovery_reasons or not allowed or self.recovery_runs >= 1:
+        reasons = list(check.recovery_reasons) + [f"weak_factor_coverage:{f}" for f in weak]
+        if not reasons or not allowed or self.recovery_runs >= 1:
             return False
         self.recovery_runs += 1
         self._stage(1, "Looking for more company sources")
-        log_event(self.db, "recovery_search_started", assessment_id=self.a.id, details={"reasons": check.recovery_reasons})
-        self.recovery_reasons = list(check.recovery_reasons)
-        rep = recover_sources(self.db, self.a, self.search, self.discovery_queries, on_progress=lambda msg: self._stage(1, msg[:300]))
+        log_event(self.db, "recovery_search_started", assessment_id=self.a.id, details={"reasons": reasons, "weak_factors": weak})
+        self.recovery_reasons = reasons
+        rep = recover_sources(self.db, self.a, self.search, self.discovery_queries, on_progress=lambda msg: self._stage(1, msg[:300]),
+                              weak_factors=weak)
         self._add_discovery_counts(rep)
         log_event(self.db, "recovery_search_completed", assessment_id=self.a.id,
                   details={"queries": rep.queries, "results_seen": rep.results_seen, "sources_processed": rep.sources_processed,
@@ -305,7 +345,18 @@ class AssessmentRunner:
         check, c = self.coverage, self.discovery_counts
         accepted = [e for e in evidence if e.evidence_lifecycle == "accepted"]
         recs = self.db.scalars(select(Recommendation).where(Recommendation.assessment_id == self.a.id)).all()
+        factors = [f["key"] for f in self.rules["factors"]]
         self.a.coverage_metrics = {
+            "factor_coverage": check.factor_report(factors),
+            "stage_seconds": dict(self.stage_seconds),
+            "model_calls": self.llm_calls,
+            "model_seconds": round(self.llm_seconds, 2),
+            "passages_deduplicated": self.duplicate_passages,
+            **getattr(self, "extraction_counts", {}),
+            "fetch_seconds": round(c.get("fetch_seconds", 0.0), 2),
+            "pdf_parse_seconds": round(c.get("pdf_parse_seconds", 0.0), 2),
+            "duplicate_documents_skipped": c.get("duplicate_documents", 0),
+            "total_seconds": round(sum(self.stage_seconds.values()), 2),
             "sources_discovered": len(self.a.sources) + c.get("candidates_rejected", 0),
             "sources_validated": check.valid_sources,
             "sources_rejected_company": check.rejected_company,
@@ -335,9 +386,18 @@ class AssessmentRunner:
             .where(Source.assessment_id == self.a.id, Source.status == "PROCESSED")
         ).all()
         out = []
+        seen_text: set[str] = set()
+        # the best source first, so that a passage repeated on several pages is kept from the best one
+        rows = sorted(rows, key=lambda r: (source_priority(r[2].source_type)["priority"], r[2].id, r[0].chunk_index))
+        self.duplicate_passages = 0
         for ch, doc, src in rows:
             if src.company_match is None or source_blocks_evidence(src):
                 continue  # no recorded identity decision means no evidence, whatever the reason
+            digest = hashlib.sha1(P.normalize_ws(ch.text).lower().encode()).hexdigest()
+            if digest in seen_text:
+                self.duplicate_passages += 1  # mirrored pages (language/region copies): read once, extracted once
+                continue
+            seen_text.add(digest)
             out.append(Passage(
                 chunk_id=ch.id, document_id=doc.id, source_id=src.id, source_title=doc.title or src.title,
                 source_url=src.url, source_type=src.source_type, source_quality=source_priority(src.source_type)["quality"],
@@ -364,10 +424,14 @@ class AssessmentRunner:
                     reverse=True,
                 )
                 by_q[(f["key"], dim)] = [passages[h.chunk_id] for h in ranked[:k]]
-        # one representative passage per processed official source (document-level reporting evidence)
+        # one representative passage per processed official source (document-level reporting evidence): the first
+        # one that actually discloses something about sustainability, else the document's first passage
         report_passages: dict[int, Passage] = {}
         for p in passages:
-            if p.source_type in OFFICIAL_SOURCE_TYPES and p.source_id not in report_passages:
+            if p.source_type not in OFFICIAL_SOURCE_TYPES:
+                continue
+            current = report_passages.get(p.source_id)
+            if current is None or (P.reporting_statement(p.text) and not P.reporting_statement(current.text)):
                 report_passages[p.source_id] = p
         log_event(self.db, "retrieval_completed", assessment_id=self.a.id,
                   details={"chunks_indexed": len(passages), "questions": len(by_q)})
@@ -383,20 +447,38 @@ class AssessmentRunner:
             self.a.progress = STAGE_PROGRESS[4] + (STAGE_PROGRESS[5] - STAGE_PROGRESS[4]) * done / total_q
             self.db.commit()
 
-        ex = FactExtractor(self.llm, self.a.year, self.settings.allow_heuristic_fallback)
+        budget = self.settings.max_llm_calls_per_assessment or None
+        ex = FactExtractor(self.llm, self.a.year, self.settings.allow_heuristic_fallback, llm_budget=budget)
+        llm_started = time.perf_counter()
         self.a.extraction_mode = ex.mode
         candidates: list[Candidate] = []
         # reporting: regex across all official chunks; LLM only on assurance passages
+        ex.current_question = (REPORTING_FACTOR, "reporting")
         candidates += ex.reporting(all_passages, report_passages)
         done += 1
         progress()
-        for (fkey, dim), passages in by_q.items():
-            self.a.stage_message = f"Extracting facts: {factor_label(fkey)} \u2014 {dim}"
-            fn = {"planning": ex.planning, "execution": ex.execution, "performance": ex.performance}[dim]
-            candidates += fn(fkey, passages)
-            done += 1
-            progress()
+        # round-robin by rank: the best passage of every question before the second-best of any, so that a call
+        # budget can never be spent on one factor while another factor's strongest passage is left unread
+        fns = {"planning": ex.planning, "execution": ex.execution, "performance": ex.performance}
+        depth = max((len(v) for v in by_q.values()), default=0)
+        for rank in range(depth):
+            for (fkey, dim), passages in by_q.items():
+                if rank >= len(passages):
+                    continue
+                self.a.stage_message = f"Extracting facts: {factor_label(fkey)} \u2014 {dim}"
+                ex.current_question = (fkey, dim)
+                candidates += fns[dim](fkey, [passages[rank]])
+                if rank == len(passages) - 1:
+                    done += 1
+                    progress()
         self.warnings.extend(ex.warnings)
+        self.llm_calls, self.llm_seconds = ex.llm_calls, ex.llm_seconds
+        self.budget_cut = set(ex.budget_cut)
+        self.extraction_counts = {"model_budget": budget, "budget_exhausted_passages": ex.budget_exhausted,
+                                  "questions_not_fully_analysed": sorted(f"{f}:{d}" for f, d in ex.budget_cut),
+                                  "model_calls_avoided": dict(ex.skipped_llm)}
+        log.info("extraction_timing: llm_calls=%d llm_seconds=%.1f other_seconds=%.1f", ex.llm_calls, ex.llm_seconds,
+                 time.perf_counter() - llm_started - ex.llm_seconds)
         if ex.llm_failures:
             self.warnings.append(f"{ex.llm_failures} LLM response(s) could not be parsed; those passages used heuristic extraction.")
         self.a.extraction_mode = ex.mode if ex.llm_calls == 0 else "llm"
@@ -536,11 +618,16 @@ class AssessmentRunner:
             # activities outside the time window explain the answer in its text but did not count towards it
             scoring_ids = assert_scoring_evidence(
                 [i for i in r.evidence_ids if not (i in items and items[i].facts.get("in_window") is False)], accepted_ids)
-            answer_coverage = coverage_state(scoring_ids, source_coverage)
+            answer_coverage = coverage_state(scoring_ids, source_coverage, factor)
+            budget_gap = not scoring_ids and (factor, dim) in getattr(self, "budget_cut", set())
+            if budget_gap:
+                # some candidate passages for this question were never read by the model: finding nothing is then
+                # not the company having nothing, so this is a gap, never a Level 1 answer
+                answer_coverage = INSUFFICIENT_SOURCE_COVERAGE
             if answer_coverage == INSUFFICIENT_SOURCE_COVERAGE:
                 # an assessment gap, not an answer: nothing was concluded, so no level is recorded
                 r.recommended_level, r.triggered_rule = NOT_ASSESSED_LEVEL, INSUFFICIENT_SOURCE_COVERAGE
-                r.reason = (BLOCKED_REPORT_REASON if source_coverage.blocked_primary_reports else
+                r.reason = (BUDGET_GAP_REASON if budget_gap else BLOCKED_REPORT_REASON if source_coverage.blocked_primary_reports else
                             "Insufficient source coverage \u2014 the system could not access enough reliable company information.")
                 r.next_level_missing = ["Upload the company's sustainability or annual report to continue the assessment."]
                 status, conf = INSUFFICIENT_SOURCE_COVERAGE, 0.2

@@ -12,10 +12,16 @@ from app.services.audit import log_event
 from app.services.company.identify import classify_source
 from app.services.company.resolution import AMBIGUOUS, identity_from_profile
 from app.services.company.source_identity import (
-    FIRST_PARTY_BASES, MISMATCH, PARENT_BOUNDARY, SOURCE_COMPANY_MISMATCH, CompanyIdentity, assess_source_identity, looks_like_company_report,
+    _FIRST_PERSON_RE, FIRST_PARTY_BASES, LEADING_TEXT_CHARS, MISMATCH, PARENT_BOUNDARY, SOURCE_COMPANY_MISMATCH, CompanyIdentity, assess_source_identity,
     on_supplied_domain,
 )
+from app.services.documents.report_kind import primary_report_kind
 from app.services.documents.url_safety import registrable_domain
+
+REPORT_TYPES = ("annual_report", "sustainability_report")
+REPORT_LINK_VIA = "report link on"
+# A first-pages verdict is only trusted when it names who the document is about instead.
+_OTHER_ENTITY_DETAILS = ("Document is about", "Web address belongs", "similar but different company", "names only")
 
 
 def source_blocks_evidence(source: Source | None) -> bool:
@@ -40,9 +46,43 @@ def record_blocked_pdf_identity(db: Session, a: Assessment, s: Source, title: st
         s.rejection_reason = SOURCE_COMPANY_MISMATCH
         log_event(db, SOURCE_COMPANY_MISMATCH, assessment_id=a.id, entity_type="source", entity_id=s.id,
                   details={"reason": SOURCE_COMPANY_MISMATCH, "detail": result.detail[:300], "url": s.url})
-    elif result.basis != PARENT_BOUNDARY and looks_like_company_report(full_title, text):
-        s.source_type = "sustainability_report"
-        s.priority = source_priority(s.source_type)["priority"]
+    elif result.basis != PARENT_BOUNDARY:
+        _set_report_type(s, primary_report_kind(full_title, text, s.url, hint=s.title or ""), result.basis, bool(_FIRST_PERSON_RE.search(text)))
+
+
+def precheck_pdf_identity(db: Session, a: Assessment, s: Source, title: str | None, text: str) -> bool:
+    """The same identity gate, run on a PDF's title and first pages before the whole document is parsed.
+    Returns False (and records the rejection exactly as the full gate would) only when those pages show that
+    the document is about another company. Anything less certain goes on to full extraction and the full gate."""
+    if not text.strip() or s.source_type == "uploaded_report":
+        return True
+    company = a.company
+    result = assess_source_identity(identity_for(a), title=title or "", url=s.url, text=text,
+                                    on_official_domain=on_supplied_domain(s.url, company.name, company.website, company.domain))
+    if result.matched or not any(d in result.detail for d in _OTHER_ENTITY_DETAILS):
+        return True
+    s.status, s.status_detail, s.rejection_reason, s.company_match = "REJECTED", result.detail[:500], SOURCE_COMPANY_MISMATCH, MISMATCH
+    log_event(db, SOURCE_COMPANY_MISMATCH, assessment_id=a.id, entity_type="source", entity_id=s.id,
+              details={"reason": SOURCE_COMPANY_MISMATCH, "detail": result.detail[:300], "url": s.url, "stage": "first_pages"})
+    return False
+
+
+def _set_report_type(s: Source, kind: str | None, basis: str, first_person: bool = False) -> None:
+    """Only the company's own company-wide report is a report type. The document decides, not its address:
+    a product carbon footprint report stays a company document, and the company's report is its report wherever
+    it is hosted: on its own site, behind a "View report" link on its own page, or on a neutral file host when the
+    document itself is a report written by the company (first person, and the identity gate tied it to the company)."""
+    if s.source_type == "uploaded_report":
+        return
+    own = (s.is_official or basis in FIRST_PARTY_BASES or (s.discovered_via or "").startswith(REPORT_LINK_VIA)
+           or (first_person and s.source_type != "external_source"))
+    if kind and own:
+        s.source_type, s.is_official = kind, True
+    elif not kind and s.source_type in REPORT_TYPES:
+        s.source_type = "company_website" if s.is_official else "other_web"
+    else:
+        return
+    s.priority = source_priority(s.source_type)["priority"]
 
 
 def apply_source_identity(db: Session, a: Assessment, s: Source) -> bool:
@@ -77,8 +117,10 @@ def apply_source_identity(db: Session, a: Assessment, s: Source) -> bool:
         # its own web address ties it to the company: an official source, whose passages inherit that identity
         s.source_type, s.is_official = classify_source(s.url, document.title or "", "", company.name, registrable_domain(s.url))
         s.priority = source_priority(s.source_type)["priority"]
-    if s.source_type in ("company_website", "investor_relations", "policy_page", "other_web") and document.doc_kind == "pdf" and looks_like_company_report(title, text):
-        # judged from the document itself: its web address may not have said it is a report
-        s.source_type = "sustainability_report"
-        s.priority = source_priority(s.source_type)["priority"]
+    # judged from the document itself: a PDF by its title and cover, a web page by its title only (a page that
+    # lists reports mentions them in its text without being one)
+    is_pdf = document.doc_kind == "pdf"
+    leading = text[:LEADING_TEXT_CHARS] if is_pdf else ""
+    _set_report_type(s, primary_report_kind(title, leading, s.url, hint=s.title or ""), result.basis,
+                     is_pdf and bool(_FIRST_PERSON_RE.search(text)))
     return True

@@ -51,6 +51,38 @@ RECOVERY_TEMPLATES = (
 )
 
 
+# Search vocabulary per factor, for the targeted recovery pass. Only used to build queries: what is found still
+# passes the same identity and evidence gates as everything else.
+FACTOR_RECOVERY_TERMS = {
+    "energy_management": ("energy consumption renewable electricity", "energy efficiency ISO 50001"),
+    "product_lifecycle": ("circular economy recycled materials", "life cycle assessment packaging waste"),
+    "data_security": ("information security cybersecurity", "data protection privacy ISO 27001"),
+    "labor_practices": ("occupational health and safety employees", "working conditions training workforce"),
+    "diversity_inclusion": ("diversity and inclusion gender", "employee engagement survey equal pay"),
+}
+
+
+def build_factor_recovery_queries(company: str, aliases: list[str], domain: str | None, year: int, factors: list[str],
+                                  already_run: list[str], limit: int) -> list[str]:
+    """One or two queries per weakly covered factor: the company's own domain first, then the company's name.
+    Factors without configured terms use their first keywords."""
+    from app.config.loader import get_factor
+
+    name = (aliases or [company])[0]
+    first: list[str] = []
+    second: list[str] = []  # every weak factor gets its first query before any factor gets a second one
+    for key in factors:
+        terms = FACTOR_RECOVERY_TERMS.get(key) or (" ".join(get_factor(key)["keywords"][:3]),)
+        if domain:
+            first.append(f"site:{domain} {terms[0]}")
+            second.append(f"{name} {terms[-1]} {year}")
+        else:
+            first.append(f"{name} {terms[0]} {year}")
+    queries = first + second
+    done = {q.lower() for q in already_run}
+    return list(dict.fromkeys(q for q in queries if q.lower() not in done))[:limit]
+
+
 def build_recovery_queries(company: str, aliases: list[str], domain: str | None, year: int, already_run: list[str], limit: int) -> list[str]:
     """The official domain comes first: first-party documents are what the recovery pass is looking for."""
     names = [*aliases, company]

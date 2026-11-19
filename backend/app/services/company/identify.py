@@ -5,6 +5,7 @@ import re
 from urllib.parse import urlparse
 
 from app.config.loader import source_priority
+from app.services.documents.report_kind import primary_report_kind
 from app.services.documents.url_safety import registrable_domain
 
 LEGAL_SUFFIXES = r"\b(ab|ag|as|asa|sa|s\.a\.|spa|s\.p\.a\.|nv|n\.v\.|bv|plc|ltd|limited|inc|inc\.|corp|corporation|co|gmbh|oy|oyj|uab|llc|group|holding|holdings)\b"
@@ -72,19 +73,14 @@ def classify_source(url: str, title: str, snippet: str, company_name: str, offic
         # Detect pages that are on an official domain but are not company ESG disclosures.
         if _is_non_disclosure_page(path, hay):
             return "other_web", False
-        if any(k in hay for k in ("sustainability report", "esg report", "sustainability-report",
-                                   "responsibility report", "impact report", "csr report",
-                                   "sustainability statement", "climate report", "environmental report")):
-            return "sustainability_report", True
-        if "annual report" in hay or "annual-report" in hay or "annualreport" in hay:
-            return "annual_report", True
-        if is_pdf and ("sustainab" in hay or "esg" in hay or "responsibility" in hay):
-            return "sustainability_report", True
-        if is_pdf and ("annual" in hay or "report" in hay):
-            return "annual_report", True
+        # Only a company-wide annual / sustainability report is a report type: a product carbon footprint
+        # report, position paper or presentation is not, even as a PDF with "report" in its name.
+        kind = primary_report_kind(title, "", url, hint=snippet)
+        if kind:
+            return kind, True
         if any(k in path for k in ("/investor", "/ir/", "investor-relations")):
             return "investor_relations", True
-        if any(k in path for k in ("/polic", "/governance", "code-of-conduct")):
+        if any(k in path for k in ("/polic", "/governance", "code-of-conduct")) or (is_pdf and re.search(r"polic|position|code[\s_-]of[\s_-]conduct|statement", hay)):
             return "policy_page", True
         return "company_website", True
     if any(h in host for h in REGULATORY_HOST_HINTS):

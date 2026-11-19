@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.config.loader import OFFICIAL_SOURCE_TYPES, get_factor, load_rules
+from app.config.loader import OFFICIAL_SOURCE_TYPES, REPORT_SOURCE_TYPES, get_factor, load_rules
 from app.services.company.source_identity import PARENT_BOUNDARY, CompanyIdentity
 from app.services.extraction import gates
 from app.services.extraction import patterns as P
@@ -206,7 +206,7 @@ def _check_company_subject(c: Candidate, text: str) -> bool:
 HARD_GATE_CODES = {
     "exclusion_keyword_match", "company_mismatch", "external_actor", "factor_mismatch", "cross_factor_mismatch",
     "numeric_not_in_source", "ambiguous_table_alignment", "inactive_goal", "activity_not_performed", "fallback_quote_not_verbatim",
-    gates.NUMERIC_SUBJECT_MISMATCH, gates.NUMERIC_CONTEXT_INVALID,
+    gates.NUMERIC_SUBJECT_MISMATCH, gates.NUMERIC_CONTEXT_INVALID, "external_purpose", "claim_quote_mismatch", "not_reporting_evidence",
 }
 
 
@@ -216,6 +216,8 @@ def _state_and_actor_codes(c: Candidate, quote: str, company: CompanyIdentity | 
         codes = ["inactive_goal"] if gates.has_no_active_goal(quote) else []
         if gates.external_goal_only(quote, is_company):
             codes.append("external_actor")
+        if gates.external_purpose_only(quote):
+            codes.append("external_purpose")  # a market, customer or societal benefit, not the company's own factor
         value = c.facts.get("target_value")
         if value is not None and c.factor != "reporting":
             issue = gates.numeric_target_issue(quote, float(value), _number_variants(float(value)), c.facts.get("target_unit"),
@@ -225,6 +227,10 @@ def _state_and_actor_codes(c: Candidate, quote: str, company: CompanyIdentity | 
         return codes
     if c.dimension == "execution":
         codes = ["activity_not_performed"] if gates.activity_not_performed(quote) else []
+        if gates.external_purpose_only(quote):
+            codes.append("external_purpose")
+        if c.facts.get("claim_quote_mismatch"):
+            codes.append("claim_quote_mismatch")
         return codes + (["external_actor"] if gates.external_actor_only(quote, ACTIVITY_RE, is_company) else [])
     if c.claim_type == "relative_change" and gates.external_actor_only(quote, P.CHANGE_VERB_RE, is_company):
         return ["external_actor"]
@@ -244,13 +250,24 @@ def verify_candidate(c: Candidate, page_text: str | None, source_ok: bool = True
             c.evidence_text, LIFECYCLE_REJECTED, ["source_unavailable"],
         )
 
-    # Reporting 'report_published' evidence is document-level: quote the title line instead.
-    if c.claim_type in ("report_published", "voluntary_disclosure"):
+    # Document-level reporting evidence. A report counts as a report only when the source is the company's
+    # company-wide report; a website page counts only for a sentence that discloses something about sustainability.
+    if c.claim_type == "report_published":
+        if c.passage.source_type not in REPORT_SOURCE_TYPES:
+            return VerificationResult(REJECTED, notes + ["The source is not the company's annual or sustainability report."],
+                                      c.evidence_text[:400], LIFECYCLE_REJECTED, ["not_reporting_evidence"])
         first = next((ln.strip() for ln in page_text.splitlines() if len(ln.strip()) > 10), page_text[:200])
         return VerificationResult(
             VERIFIED, notes + ["Document-level evidence (source was retrieved and processed)."],
             first[:400], LIFECYCLE_ACCEPTED, [],
         )
+    if c.claim_type == "voluntary_disclosure":
+        found, quote, _ = gates.locate_quote(c.evidence_text, page_text)
+        if not found or not P.reporting_statement(quote) or c.passage.source_type not in OFFICIAL_SOURCE_TYPES:
+            return VerificationResult(REJECTED, notes + ["The text does not disclose anything about sustainability."],
+                                      c.evidence_text[:400], LIFECYCLE_REJECTED, ["not_reporting_evidence"])
+        return VerificationResult(VERIFIED, notes + ["Sustainability disclosure on the company's own website."],
+                                  quote[:400], LIFECYCLE_ACCEPTED, [])
 
     # ── GATE 1: factor exclusion keywords ──────────────────────────────────────
     if c.factor != "reporting" and _check_exclusion_keywords(c.factor, c.evidence_text or page_text):
@@ -324,6 +341,10 @@ def verify_candidate(c: Candidate, page_text: str | None, source_ok: bool = True
         notes.append("The goal is discontinued, absent or only being considered, so it is not an active commitment.")
     if "activity_not_performed" in state_codes:
         notes.append("The activity was not carried out, or has not happened yet.")
+    if "external_purpose" in state_codes:
+        notes.append("Its purpose is a benefit to customers, markets or society, not the management of the company's own operations.")
+    if "claim_quote_mismatch" in state_codes:
+        notes.append("The quote does not state the reported finding, and no source sentence that does was found.")
 
     if c.method == "heuristic":
         notes.append("Facts extracted by keyword/regex fallback (local LLM not used).")

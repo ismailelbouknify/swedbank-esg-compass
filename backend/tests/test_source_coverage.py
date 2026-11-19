@@ -234,7 +234,10 @@ def test_not_assessed_answer_cannot_be_approved_but_an_analyst_can_set_a_level(c
     assert r.status_code == 200 and r.json()["final_level"] == 2
 
 
-def test_sufficient_sources_without_evidence_is_no_evidence(client, web, monkeypatch):
+def test_generic_company_pages_do_not_make_no_evidence_honest_for_every_factor(client, web, monkeypatch):
+    """Case B: several general sustainability pages, no company report, nothing about data security. That is
+    enough to judge the company's reporting, but not to conclude it has no data security goals: retrieval
+    finding nothing is not the company having nothing. (Was: NO_EVIDENCE_FOUND / Level 1 for every factor.)"""
     monkeypatch.setattr(get_settings(), "recovery_search_enabled", False)
     neutral = _page("About | Northstar Manufacturing", ABOUT)
     urls = [(f"{SITE}/about/{i}", f"{NAME} about {i}") for i in range(3)]
@@ -245,8 +248,10 @@ def test_sufficient_sources_without_evidence_is_no_evidence(client, web, monkeyp
     a, sources, recs, _ = _state(aid)
     assert sum(s.status == "PROCESSED" for s in sources) == 3
     gap = recs[("data_security", "planning")]
-    assert gap.coverage_state == NO_EVIDENCE_FOUND == gap.evidence_status
-    assert gap.recommended_level == 1 and gap.reason.startswith("No evidence of")
+    assert gap.coverage_state == INSUFFICIENT_SOURCE_COVERAGE and gap.recommended_level != 1
+    assert a.coverage_metrics["factor_coverage"]["data_security"]["basis"] == "no_primary_report_and_few_factor_sources"
+    # the company-level reporting question rests on the company's own sustainability pages
+    assert recs[("reporting", "reporting")].coverage_state in ("EVIDENCE_FOUND", NO_EVIDENCE_FOUND)
 
 
 def test_one_real_report_is_enough_to_say_no_evidence_for_a_missing_topic(client, sample_pdf):
@@ -703,7 +708,11 @@ def test_another_companys_blocked_report_does_not_create_a_gap(client, web, monk
     run_assessment(aid, llm=FakeLLM(), search=Search(first=urls))
     a, sources, recs, _ = _state(aid)
     assert a.coverage_metrics["primary_reports_blocked"] == 0
-    assert recs[("data_security", "planning")].coverage_state == NO_EVIDENCE_FOUND
+    # no gap is attributed to the other company's report: the factor with its own sources is covered, and the one
+    # without is a gap only because no company report and too few pages about it were read
+    fc = a.coverage_metrics["factor_coverage"]
+    assert fc["energy_management"]["basis"] == "factor_official_sources" and fc["energy_management"]["sufficient"]
+    assert fc["data_security"]["basis"] == "no_primary_report_and_few_factor_sources"
 
 
 def test_unavailable_or_invalid_report_is_not_called_blocked_by_a_limit(client, web, monkeypatch):
@@ -745,6 +754,7 @@ def test_blocked_report_with_a_neutral_title_is_identified_from_its_first_pages(
     assert source.status == "REJECTED" and source.fetch_outcome == "pdf_page_limit_exceeded" and source.company_match
     assert a.coverage_metrics["primary_reports_blocked"] == 1
     assert recs[("data_security", "planning")].coverage_state == INSUFFICIENT_SOURCE_COVERAGE
+    assert a.coverage_metrics["factor_coverage"]["energy_management"]["basis"] == "primary_report_blocked"
     assert not [e for e in evidence if e.source_id == source.id]
 
     web[other] = ("application/pdf", _two_page_pdf("Bluefin Foods Ltd"))
@@ -754,7 +764,7 @@ def test_blocked_report_with_a_neutral_title_is_identified_from_its_first_pages(
     source = {s.url: s for s in sources}[other]
     assert source.company_match == "mismatch" and source.rejection_reason == "source_company_mismatch"
     assert a.coverage_metrics["primary_reports_blocked"] == 0
-    assert recs[("data_security", "planning")].coverage_state == NO_EVIDENCE_FOUND
+    assert a.coverage_metrics["factor_coverage"]["energy_management"]["basis"] == "factor_official_sources"
 
 
 def test_report_too_large_to_download_with_a_neutral_title_cannot_be_attributed(client, web, monkeypatch):

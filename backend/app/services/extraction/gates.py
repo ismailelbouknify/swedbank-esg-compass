@@ -269,3 +269,74 @@ def numeric_target_issue(quote: str, value: float, value_forms: set[str], unit: 
 
 def _action_of_someone_else(clause: str, is_company: IsCompany | None) -> bool:
     return bool(_EXTERNAL_GOAL_RE.search(clause) or _OBLIGATION_RE.search(clause)) and not _company_named(clause, is_company)
+
+
+# ---------------------------------------------------------------- purpose: whose factor is being managed?
+# A goal or activity whose stated purpose is someone else's benefit (customers, communities, grids, a market,
+# policy makers) is not the company's management of its own factor, unless it is also tied to the company's own
+# operations. "We aim to help customers cut energy use" is a customer benefit; "we aim to cut the energy use of
+# our data centres" is energy management.
+_EXTERNAL_PURPOSE_RE = re.compile(
+    r"\bbring(?:s|ing)?\b[^.;]{0,60}\bto\s+market\b|\bcommerciali[sz]\w*|\bgo[- ]to[- ]market\b"
+    r"|\bhelp(?:s|ed|ing)?\s+(?:our\s+|their\s+)?(?:customers?|clients?|consumers?|users?|communities|cities|utilities|grids?|"
+    r"society|others|partners|businesses|organi[sz]ations|countries|governments?|the\s+world|people\s+everywhere)\b"
+    r"|\benabl(?:e|es|ed|ing)\s+(?:our\s+)?(?:customers?|clients?|users?|others|communities|partners|cities|businesses|organi[sz]ations|countries|society)\b"
+    r"|\bcommunities\s+everywhere\b|\bresilience\s+of\s+(?:the\s+)?grids?\b|\bsupport(?:s|ing)?\s+(?:the\s+)?grids?\b"
+    r"|\bpolicy\s+(?:recommendations?|advocacy|makers?|engagement)\b|\bpolicymakers?\b|\badvoca(?:te|tes|ted|cy|ting)\b|\blobby\w*"
+    r"|\binvest(?:s|ed|ing|ments?)?\s+in\s+(?:start-?ups?|ventures?|funds?|third[- ]party|external)\b",
+    re.IGNORECASE,
+)
+_OWN_OPERATIONS_RE = re.compile(
+    r"\bour\s+(?:own\s+)?(?:global\s+)?(?:operations?|operational|data\s+cent(?:er|re)s?|facilit(?:y|ies)|sites?|offices?|buildings?|"
+    r"plants?|factor(?:y|ies)|campus(?:es)?|fleet|vehicles?|manufacturing|production|energy\s+(?:use|consumption)|"
+    r"electricity\s+(?:use|consumption)|consumption|footprint|emissions|workforce|employees|staff|people|supply\s+chain|"
+    r"products?|packaging|value\s+chain|stores?|warehouses?|business|company|group|organi[sz]ation|it\s+systems?|systems?|networks?)\b"
+    r"|\bcompany[- ]wide\b|\bgroup[- ]wide\b|\binternal(?:ly)?\b|\bin[- ]house\b|\bown\s+(?:operations|use|consumption)\b",
+    re.IGNORECASE,
+)
+
+
+def external_purpose_only(text: str) -> bool:
+    """True when every sentence's stated purpose is an external benefit and none ties it to the company's own operations."""
+    sentences = [s for s in (P.split_sentences(text) or [text]) if _EXTERNAL_PURPOSE_RE.search(s)]
+    return bool(sentences) and not _OWN_OPERATIONS_RE.search(text)
+
+
+# ---------------------------------------------------------------- finding / quote alignment
+_STOP = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "by", "at", "from", "as", "our", "we", "its", "their",
+    "this", "that", "these", "those", "is", "are", "was", "were", "be", "been", "has", "have", "had", "it", "which", "also",
+    "all", "more", "than", "into", "up", "over", "under", "per", "new",
+}
+MIN_CLAIM_SUPPORT = 0.5
+
+
+def _content_words(text: str) -> set[str]:
+    return {w.rstrip("s") for w in re.findall(r"[a-z0-9][a-z0-9-]+", P.normalize_ws(text)) if w not in _STOP and len(w) > 2}
+
+
+def claim_supported_by_quote(claim: str, quote: str) -> bool:
+    """Does the quote state the finding? Most of the finding's content words, and every number in it, must be in
+    the quote. A different statement on the same page (same company, same topic, same year) does not support it."""
+    words = _content_words(claim)
+    if not words:
+        return True
+    numbers = set(re.findall(r"\d+(?:[.,]\d+)?", claim)) - set(re.findall(r"\d+(?:[.,]\d+)?", quote))
+    if numbers:
+        return False
+    return len(words & _content_words(quote)) / len(words) >= MIN_CLAIM_SUPPORT
+
+
+def supporting_sentence(claim: str, text: str) -> str | None:
+    """The sentence of the retrieved text that states the finding, verbatim, if exactly one does best."""
+    best, best_share = None, 0.0
+    words = _content_words(claim)
+    if not words:
+        return None
+    for sentence in P.split_sentences(text):
+        if not claim_supported_by_quote(claim, sentence):
+            continue
+        share = len(words & _content_words(sentence)) / len(words)
+        if share > best_share:
+            best, best_share = sentence, share
+    return best

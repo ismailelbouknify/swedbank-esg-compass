@@ -50,8 +50,38 @@ def extract_html(html: str | bytes, base_url: str) -> HtmlContent:
         except ValueError:  # a malformed link in untrusted HTML must not stop the page
             continue
         if scheme in ("http", "https"):
-            links.append((href, a.get_text(" ", strip=True)[:200]))
+            anchor = a.get_text(" ", strip=True)[:200]
+            context = _link_context(a, anchor)
+            links.append((href, f"{context} | {anchor}" if context else anchor))
     return HtmlContent(title=title, text=text, links=links)
+
+
+# "View report", "Download", "PDF", "Read more": a label that says nothing about which document it opens
+_GENERIC_ANCHOR_RE = re.compile(r"^(?:view|download|open|read|see|get|pdf|here|more|report|the report|full report|"
+                                r"read more|learn more|click here|view report|download report|download pdf|view pdf|"
+                                r"read the report|\(?pdf[^)]{0,12}\)?|[\d.,]+\s*[mk]b)?$", re.IGNORECASE)
+MAX_LINK_CONTEXT_CHARS = 160
+
+
+def _link_context(a, anchor: str) -> str:
+    """For a generic link label, the nearest heading or the short block around the link ('Annual Report |
+    View report'). Nothing for descriptive labels, and nothing from a block that holds a whole page section."""
+    if len(anchor.split()) > 4 or not _GENERIC_ANCHOR_RE.match(anchor.strip(" :»›→-")):
+        return ""
+    node = a
+    for _ in range(4):
+        node = node.parent
+        if node is None or node.name in ("body", "html", "[document]"):
+            return ""
+        heading = node.find(re.compile(r"^h[1-6]$")) or node.find(["strong", "b", "dt", "figcaption"])
+        if heading is not None and heading is not a:
+            text = heading.get_text(" ", strip=True)
+            if text and text.lower() != anchor.lower():
+                return text[:MAX_LINK_CONTEXT_CHARS]
+        text = " ".join(node.get_text(" ", strip=True).split())
+        if text and text.lower() != anchor.lower():
+            return text[:MAX_LINK_CONTEXT_CHARS] if len(text) <= MAX_LINK_CONTEXT_CHARS * 2 else ""
+    return ""
 
 
 def relevant_links(content: HtmlContent, domain: str | None, limit: int) -> list[str]:

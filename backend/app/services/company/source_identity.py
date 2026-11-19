@@ -65,6 +65,7 @@ class CompanyIdentity:
     organisation_number: str | None = None
     aliases: tuple[str, ...] = ()  # names the resolution step established for this company
     excluded: tuple[str, ...] = ()  # other entities carrying a similar name
+    official_domain: str | None = None  # the domain resolution established for this company, if any
 
     @cached_property
     def normalized(self) -> str:
@@ -168,6 +169,21 @@ def _domain_is_company_name(identity: CompanyIdentity, url: str | None) -> bool:
     return bool(_domain_labels(url) & names)
 
 
+def _domain_may_speak_for_company(identity: CompanyIdentity, url: str | None) -> bool:
+    """Once resolution has settled the company's official domain, another domain that merely spells the same
+    name (a country variant, a reseller, a namesake) is not the company's own address. It is then judged by its
+    text like any other page. A brand top-level domain (sustainability.brand) belongs to the brand's registry."""
+    official = identity.official_domain
+    if not official or not url or "://" not in url:
+        return True
+    domain = registrable_domain(url) or ""
+    if domain == official:
+        return True
+    parts = domain.split(".")
+    names = {"".join(identity.tokens)} | {a.replace(" ", "") for a in identity.aliases}
+    return len(parts) >= 2 and len(parts[-1]) > 3 and parts[-1] in names
+
+
 _BOUNDARY_TERMS = r"(?:subsidiar(?:y|ies)|reporting\s+boundary|scope\s+of\s+(?:this|the)\s+report|included\s+in\s+(?:this|the)\s+report|consolidated\s+entit)"
 
 
@@ -241,7 +257,7 @@ def assess_source_identity(identity: CompanyIdentity, *, title: str | None, url:
         return _rejected(identity, text, entity_problem)
     if identity.aliases and aliased == 0:
         return _rejected(identity, text, "Does not name the company this assessment was resolved to.")
-    if _domain_is_company_name(identity, url) and (full >= 1 or aliased >= 1):
+    if _domain_is_company_name(identity, url) and _domain_may_speak_for_company(identity, url) and (full >= 1 or aliased >= 1):
         return IdentityResult(True, "name_domain", "The web address is the company's exact name, and the document names the company.")
     if other_count >= 2 and other_count > max(mentions, aliased):
         return _rejected(identity, text, f"Document is about '{other}' ({other_count} mentions, assessed company {mentions}).")

@@ -76,6 +76,10 @@ class Settings(BaseSettings):
     # Passages sent to extraction per factor x dimension question. Each can cost one LLM call,
     # so keep this small for CPU inference; the keyword fallback can afford more.
     max_chunks_per_question: int = 4
+    # Hard limit on model calls per assessment (~24 s each on CPU). Passages are handed out round-robin over all
+    # factor x dimension questions, so the best passage of every question is read first; anything beyond the
+    # limit goes to the deterministic extractor and is verified like everything else. 0 = no limit.
+    max_llm_calls_per_assessment: int = 30
     heuristic_chunks_per_question: int = 10
     retrieval_candidates: int = 30  # BM25 candidates re-ranked by a cheap regex signal
     max_llm_context_chars: int = 6000  # ~1500 tokens of passage text

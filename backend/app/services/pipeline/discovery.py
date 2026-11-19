@@ -23,9 +23,12 @@ from app.services.documents.html_extractor import extract_html, relevant_links
 from app.services.documents.url_safety import registrable_domain
 from app.services.pipeline.ingest import ingest_html, ingest_pdf
 from app.services.documents.pdf_extractor import peek_pdf
-from app.services.pipeline.source_gate import apply_source_identity, identity_for, record_blocked_pdf_identity
+from app.services.documents.report_kind import primary_report_kind
+from app.services.pipeline.source_gate import (
+    REPORT_LINK_VIA, apply_source_identity, identity_for, precheck_pdf_identity, record_blocked_pdf_identity,
+)
 from app.services.extraction.patterns import YEAR_RE
-from app.services.search.base import SearchProvider, SearchResult, build_queries, build_recovery_queries
+from app.services.search.base import SearchProvider, SearchResult, build_factor_recovery_queries, build_queries, build_recovery_queries
 from app.services.security import policy
 from app.services.security.policy import SourceRejection
 from app.services.security.safe_fetch import FetchResult, fetch, source_deadline
@@ -61,11 +64,14 @@ def _find_report_links(content, official_domain: str | None, year: int | None = 
         is_pdf = url.lower().split("?")[0].endswith(".pdf")
         if official_domain and not is_pdf and not (host == official_domain or host.endswith("." + official_domain)):
             continue
+        # the label includes the text around a generic "View report" / "Download" link (see extract_html)
         hay = (url + " " + anchor).lower()
         score = sum(1 for kw in _REPORT_LINK_KEYWORDS if kw in hay)
         if score == 0:
             continue
         score += 3 if is_pdf else 0
+        # the company-wide report first; a product report or presentation only after it
+        score += 4 if primary_report_kind(anchor, "", url) else -4
         years = [int(y) for y in YEAR_RE.findall(hay) if year is None or int(y) <= year + 1]
         if years and year is not None:
             score += 3 if max(years) >= year - 1 else -2
@@ -93,12 +99,39 @@ class DiscoveryReport:
     candidates_rejected: int = 0  # URLs refused before any request; no source was created for them
     candidates_other_entity: int = 0  # on the web address of another company with a similar name
     searches_failed: int = 0
+    fetch_seconds: float = 0.0  # HTTP time, all sources
+    pdf_parse_seconds: float = 0.0  # PDF text extraction time
+    duplicate_documents: int = 0  # byte-identical to a document already read in this assessment: not parsed again
 
     @property
     def coverage_limited(self) -> bool:
         """Missing evidence may reflect unreadable sources rather than missing company activity."""
         return bool(self.sources_rejected or self.sources_unavailable
                     or (self.candidates_rejected and not self.sources_processed))
+
+
+def url_key(url: str) -> str:
+    """One key for the same page reached as http/https, with or without www, a trailing slash or a fragment."""
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return url
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    path = parsed.path.rstrip("/") or "/"
+    return f"{host}{path}" + (f"?{parsed.query}" if parsed.query else "")
+
+
+class _SeenUrls(set):
+    """A set of URLs compared by url_key: an http and an https copy of one page are fetched once."""
+
+    def __init__(self, urls=()):
+        super().__init__(url_key(u) for u in urls)
+
+    def add(self, url: str) -> None:  # type: ignore[override]
+        super().add(url_key(url))
+
+    def __contains__(self, url: object) -> bool:
+        return isinstance(url, str) and super().__contains__(url_key(url))
 
 
 def _well_formed(url: str) -> bool:
@@ -151,7 +184,14 @@ def _process_pdf(db: Session, s: Source, res: FetchResult, report: DiscoveryRepo
     are released as soon as extraction is over, whatever its outcome."""
     started = time.monotonic()
     try:
-        document = ingest_pdf(db, s, res.content, deadline=deadline)
+        # whose document is it? Its first pages are enough to refuse another company's report without parsing all of it
+        if not precheck_pdf_identity(db, s.assessment, s, *peek_pdf(res.content)):
+            return
+        parse_started = time.monotonic()
+        try:
+            document = ingest_pdf(db, s, res.content, deadline=deadline)
+        finally:
+            report.pdf_parse_seconds += time.monotonic() - parse_started
         log_event(db, "temporary_pdf_processed", assessment_id=s.assessment_id, entity_type="source", entity_id=s.id,
                   details={"bytes": res.size, "pages": document.page_count, "sha256": res.sha256, "scan": res.scan_status,
                            "seconds": round(time.monotonic() - started, 2), "stored": False})
@@ -173,10 +213,23 @@ def _download_into(db: Session, s: Source, report: DiscoveryReport, expect: str 
     """Fetch and ingest one source. Returns None when it was rejected or unavailable."""
     db.commit()  # never hold the SQLite write lock during network I/O
     deadline = source_deadline()
+    fetch_started = time.monotonic()
     try:
         res = fetch(s.url, expect=expect, deadline=deadline)
     except SourceRejection as exc:
         _mark_unprocessed(db, s, exc, report)
+        db.commit()
+        return None
+    finally:
+        report.fetch_seconds += time.monotonic() - fetch_started
+    twin = _identical_document(db, s, res.sha256) if res.kind == "pdf" else None
+    if twin is not None:
+        # the same PDF under another address (a mirror, a CDN copy, a tracking link): parsed once. Web pages are
+        # cheap to read; their repeated passages are removed before extraction instead.
+        s.status, s.status_detail, s.fetch_outcome = "SKIPPED", f"Same document as source {twin.id}", "duplicate_content"
+        s.content_sha256, s.bytes_downloaded, s.content_type = res.sha256, res.size, res.content_type
+        report.duplicate_documents += 1
+        res.content = b""
         db.commit()
         return None
     s.content_type = res.content_type
@@ -199,6 +252,14 @@ def _download_into(db: Session, s: Source, report: DiscoveryReport, expect: str 
     return res if s.status != "REJECTED" else None
 
 
+def _identical_document(db: Session, s: Source, sha256: str) -> Source | None:
+    """A source of this assessment already read whose content is byte-identical."""
+    from sqlalchemy import select
+
+    return db.scalar(select(Source).where(Source.assessment_id == s.assessment_id, Source.id != s.id,
+                                          Source.content_sha256 == sha256, Source.status == "PROCESSED").limit(1))
+
+
 @dataclass
 class _Pass:
     """One bounded pass over sources: what has been seen and how much may still be fetched."""
@@ -218,6 +279,7 @@ class _Pass:
     def follow_report_links(self, content, page_url: str, via: str, hops: int = PRIMARY_DOCUMENT_HOPS) -> None:
         """From a landing page to the report itself: the page listing reports is not the report."""
         db, a = self.db, self.a
+        labels = dict(getattr(content, "links", None) or [])
         for link in _find_report_links(content, self.report.official_domain, a.year):
             is_pdf = link.lower().split("?")[0].endswith(".pdf")
             if link in self.seen_urls or self.out_of_time() or (self.pdf_budget if is_pdf else self.html_budget) <= 0:
@@ -225,8 +287,9 @@ class _Pass:
             self.seen_urls.add(link)
             if not _admit(db, a, link, self.report):
                 continue
-            stype, official = classify_source(link, "", "", a.company.name, self.report.official_domain)
-            source = _new_source(db, a, link, link.rsplit("/", 1)[-1] or link, stype, official, f"report link on {via}"[:255])
+            label = labels.get(link) or ""
+            stype, official = classify_source(link, label, "", a.company.name, self.report.official_domain)
+            source = _new_source(db, a, link, label[:300] or link.rsplit("/", 1)[-1] or link, stype, official, f"{REPORT_LINK_VIA} {via}"[:255])
             self.progress(f"Downloading primary report: {link}")
             res = _download_into(db, source, self.report)
             if source.rejection_reason:
@@ -247,8 +310,9 @@ class _Pass:
         other_domains = {e.replace(" ", "") for e in identity.excluded}
         unique: dict[str, SearchResult] = {}
         for r in results:
-            if r.url and r.url not in unique and r.url not in self.seen_urls:
-                unique[r.url] = r
+            key = url_key(r.url) if r.url else ""
+            if r.url and key not in unique and r.url not in self.seen_urls:
+                unique[key] = r
         rank = lambda r: rank_search_result(r.url, r.title, r.snippet, company.name, report.official_domain, a.year)  # noqa: E731
         taken = 0
         for r in sorted(unique.values(), key=rank, reverse=True):
@@ -329,15 +393,19 @@ def discover(db: Session, a: Assessment, provider: SearchProvider, do_search: bo
     company = a.company
     report = DiscoveryReport(official_domain=company.domain)
     progress = on_progress or (lambda _msg: None)
-    run = _Pass(db, a, report, progress, {s.url for s in a.sources if s.url}, settings.max_downloaded_pdfs, settings.max_pages_per_site,
-                settings.max_search_results)
+    run = _Pass(db, a, report, progress, _SeenUrls(s.url for s in a.sources if s.url), settings.max_downloaded_pdfs,
+                settings.max_pages_per_site, settings.max_search_results)
 
     # 1) official website (if provided): homepage + a few ESG-relevant links
     if company.website and settings.enable_external_fetch:
         try:
             progress(f"Reading company website {company.website}")
             db.commit()
-            home = fetch(company.website, expect="html")
+            fetch_started = time.monotonic()
+            try:
+                home = fetch(company.website, expect="html")
+            finally:
+                report.fetch_seconds += time.monotonic() - fetch_started
             content = extract_html(home.content, home.final_url)
             report.official_domain = company.domain = registrable_domain(home.final_url) or company.domain
             s = _new_source(db, a, home.final_url, content.title or company.name, "company_website", True, "company website")
@@ -397,19 +465,31 @@ def discover(db: Session, a: Assessment, provider: SearchProvider, do_search: bo
 
 
 def recover_sources(db: Session, a: Assessment, provider: SearchProvider, earlier_queries: list[str],
-                    on_progress: Callable[[str], None] | None = None) -> DiscoveryReport:
-    """The single bounded extra search when coverage is too thin: broader queries, the same hard gates."""
+                    on_progress: Callable[[str], None] | None = None, weak_factors: list[str] | None = None) -> DiscoveryReport:
+    """The single bounded extra search when coverage is too thin: queries targeted at the factors with weak
+    coverage first, then broader report queries; the same hard gates, and the identity settled earlier is never changed."""
     settings = get_settings()
     company = a.company
     report = DiscoveryReport(official_domain=company.domain)
     progress = on_progress or (lambda _msg: None)
     deadline = time.monotonic() + settings.recovery_time_budget_seconds
     profile = a.company_identity or {}
-    queries = build_recovery_queries(company.name, list(profile.get("aliases") or []), company.domain, a.year, earlier_queries, settings.recovery_max_queries)
+    aliases = list(profile.get("aliases") or [])
+    limit = settings.recovery_max_queries
+    targeted = build_factor_recovery_queries(company.name, aliases, company.domain, a.year, weak_factors or [], earlier_queries, limit)
+    general = build_recovery_queries(company.name, aliases, company.domain, a.year, earlier_queries + targeted, limit)
+    queries = _interleave_queries(targeted, general, limit)
     results = _run_searches(provider, queries, report, progress, pause=settings.recovery_search_pause_seconds, deadline=deadline)
     _resolve_identity(a, report, results, may_choose_entity=False)
     if results:
-        _Pass(db, a, report, progress, {s.url for s in a.sources if s.url}, settings.recovery_max_pdfs, settings.recovery_max_pages,
+        _Pass(db, a, report, progress, _SeenUrls(s.url for s in a.sources if s.url), settings.recovery_max_pdfs, settings.recovery_max_pages,
               settings.recovery_max_pages + settings.recovery_max_pdfs, deadline).take_results(results)
     db.commit()
     return report
+
+
+def _interleave_queries(targeted: list[str], general: list[str], limit: int) -> list[str]:
+    """Factor queries first, but always keep room for report searches: the report answers most factors at once."""
+    keep_general = min(len(general), max(2, limit // 3)) if targeted else len(general)
+    head = targeted[: max(0, limit - keep_general)]
+    return list(dict.fromkeys(head + general))[:limit]

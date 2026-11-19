@@ -85,4 +85,5 @@ def resolve_company(name: str, organisation_number: str | None, website_domain: 
 
 def identity_from_profile(name: str, organisation_number: str | None, profile: dict[str, Any] | None) -> CompanyIdentity:
     profile = profile or {}
-    return CompanyIdentity(name, organisation_number, aliases=tuple(profile.get("aliases") or ()), excluded=tuple(profile.get("excluded") or ()))
+    return CompanyIdentity(name, organisation_number, aliases=tuple(profile.get("aliases") or ()), excluded=tuple(profile.get("excluded") or ()),
+                           official_domain=profile.get("official_domain") or None)

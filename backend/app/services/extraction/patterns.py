@@ -113,18 +113,54 @@ def matched_terms(text: str, terms: list[str]) -> list[str]:
 class FrameworkMention:
     framework: str
     sentence: str
-    explicit: bool  # "in accordance with GRI", "GRI content index", ...
+    explicit: bool  # the company's reporting is prepared in accordance with / with reference to the framework
+    code_reference: bool = False  # cites the framework's disclosure codes ("GRI 302-1", "ESRS E1-5"): a reference
+    content_index: bool = False  # a content index / index of disclosure requirements for the framework: a reference
+
+
+# A. Reporting-framework USE: the report, statement or disclosures are prepared / reported under the framework.
+_FRAMEWORK_USE_RE = re.compile(
+    r"\b(?:in\s+accordance\s+with|with\s+reference\s+to|prepared\s+(?:according\s+to|in\s+line\s+with|following|under|using)|"
+    r"in\s+compliance\s+with|compl(?:y|ies)\s+with|report(?:s|ed)?\s+(?:according\s+to|in\s+line\s+with|under))\b",
+    re.IGNORECASE,
+)
+# The auditor's description of its own work ("evaluate whether ... is prepared in accordance with ESRS") is about
+# the auditor's procedures, not the company stating how it reports.
+_AUDITOR_PROCEDURE_RE = re.compile(
+    r"\b(?:evaluate\s+whether|obtain\s+an\s+understanding|by\s+inquir(?:y|ies)|our\s+(?:responsibility|procedures|conclusion|opinion)|"
+    r"we\s+(?:have\s+)?(?:conducted|performed|planned|evaluated|examined)|nothing\s+has\s+come\s+to\s+our\s+attention|"
+    r"auditor'?s?\s+(?:responsibility|report)|assurance\s+engagement|perform(?:ed)?\s+procedures)\b",
+    re.IGNORECASE,
+)
+FRAMEWORK_USE_DISTANCE = 60  # characters between "in accordance with" and the framework's name
+_REPORTING_OBJECT_RE = re.compile(r"\b(?:report(?:s|ed|ing)?|statements?|disclosures?|prepared)\b", re.IGNORECASE)
+# B. Mere references: a metric definition, disclosure codes, an index, last year's report, someone else's reporting.
+_DISCLOSURE_CODE_RE = re.compile(
+    r"\bGRI\s*(?:[Dd]isclosures?\s*)?\d{3}(?:-\d+[a-z]?)?\b|\bGRI\s+\d{1,3}\s*:\s*20\d{2}\b"
+    r"|\bESRS\s*(?:[ESG]\d{1,2}(?:-\d+)?|[12])\b|\b[A-Z]{2}-[A-Z]{2}-\d{3}[a-z]\.\d+\b",
+)
+_CONTENT_INDEX_RE = re.compile(r"\bcontent\s+index\b|\bindex\s+of\b[^.]{0,40}\bdisclosure", re.IGNORECASE)
+_HISTORICAL_RE = re.compile(r"\b(?:last|previous|prior)\s+year(?:'s)?\b|\bpreviously\b|\b(?:was|were)\s+based\s+on\b|\bformerly\b", re.IGNORECASE)
+_OTHERS_REPORTING_RE = re.compile(r"\b(?:suppliers?|participants?|investees?|portfolio\s+companies|customers?|clients?)\b", re.IGNORECASE)
 
 
 def detect_frameworks(text: str) -> list[FrameworkMention]:
+    """explicit = the company states that its reporting follows the framework (A). Disclosure codes, metric
+    definitions, content indexes, last year's practice and others' reporting are references (B): they never make a
+    mention explicit, though several of them together can show adoption (see scoring.reporting)."""
     rules = load_rules()["reporting_rules"]
-    adherence = rules["framework_adherence_patterns"]
     out: list[FrameworkMention] = []
     for sentence in split_sentences(text):
         for name, patterns in rules["frameworks"].items():
-            if any(re.search(p if p.startswith("\\b") else re.escape(p), sentence, re.IGNORECASE) for p in patterns):
-                explicit = any(a in sentence.lower() for a in adherence)
-                out.append(FrameworkMention(name, sentence, explicit))
+            hits = [m for pat in patterns for m in re.finditer(pat if pat.startswith("\\b") else re.escape(pat), sentence, re.IGNORECASE)]
+            if not hits:
+                continue
+            # the use phrase must govern this framework: "prepared in accordance with [the] ESRS", not "reported under fuel"
+            governed = any(0 <= h.start() - u.end() <= FRAMEWORK_USE_DISTANCE for u in _FRAMEWORK_USE_RE.finditer(sentence) for h in hits)
+            explicit = (governed and bool(_REPORTING_OBJECT_RE.search(sentence)) and not _AUDITOR_PROCEDURE_RE.search(sentence)
+                        and not _HISTORICAL_RE.search(sentence) and not _OTHERS_REPORTING_RE.search(sentence))
+            out.append(FrameworkMention(name, sentence, explicit, bool(_DISCLOSURE_CODE_RE.search(sentence)),
+                                        bool(_CONTENT_INDEX_RE.search(sentence))))
     return out
 
 
@@ -135,6 +171,7 @@ class AssuranceMention:
     standard: str | None
     covers_sustainability: bool
     level: str | None  # limited | reasonable | None
+    third_party: bool = False  # performed by an independent / third-party assurance provider (named or not)
 
 
 def detect_assurance(text: str) -> list[AssuranceMention]:
@@ -154,24 +191,112 @@ def detect_assurance(text: str) -> list[AssuranceMention]:
             if std.lower() in low:
                 standard = std
                 break
-        covers = any(k in low for k in ("sustainability", "esg", "non-financial", "gri", "esrs", "csrd", "report", "kpi", "indicators", "sasb"))
-        # Financial-statement or statutory-accounts assurance must not satisfy
-        # the sustainability assurance requirement (Reporting level 6).
-        financial_only = any(k in low for k in (
-            "financial statements", "statutory accounts", "financial report",
-            "consolidated financial", "annual accounts", "statutory audit",
-            "financial information only",
-        )) and not any(k in low for k in ("sustainability", "esg", "non-financial", "gri", "esrs", "csrd", "kpi"))
-        if financial_only:
+        # a table row or footnote running on for many words says nothing reliable about what was assured
+        scope = low if len(s.split()) <= MAX_ASSURANCE_SENTENCE_WORDS else ""
+        # Level 6 needs assurance of the sustainability report / statement / disclosures / metrics themselves.
+        # A certification scheme, the ESEF/XBRL format of the annual report, the financial statements, or the
+        # verification of a product, site, project, asset or credit is assurance of something else.
+        covers = (bool(_ASSURANCE_SCOPE_RE.search(scope)) and not _ASSURANCE_NOT_DISCLOSURE_RE.search(scope)
+                  and not _ASSURANCE_NEGATED_RE.search(scope))
+        if covers and _ASSURANCE_OTHER_OBJECT_RE.search(scope) and not _SUSTAINABILITY_REPORT_SCOPE_RE.search(scope):
             covers = False
         level = "reasonable" if "reasonable assurance" in low else "limited" if "limited assurance" in low else None
-        out.append(AssuranceMention(s, provider, standard, covers, level))
+        third_party = bool(provider) or bool(_THIRD_PARTY_RE.search(scope))
+        out.append(AssuranceMention(s, provider, standard, covers, level, third_party))
     return out
+
+
+# What a sustainability assurance statement is about: the sustainability report / statement, or its data and metrics.
+MAX_ASSURANCE_SENTENCE_WORDS = 60
+_SUSTAINABILITY_REPORT_SCOPE_RE = re.compile(
+    r"\b(?:statutory\s+)?(?:sustainability|esg|non-financial|csr|climate|corporate\s+responsibility)\s+"
+    r"(?:report(?:ing)?|statements?|information|disclosures?|data|metrics|kpis|indicators)\b"
+)
+_ASSURANCE_SCOPE_RE = re.compile(
+    _SUSTAINABILITY_REPORT_SCOPE_RE.pattern
+    + r"|\b(?:ghg|greenhouse\s+gas|emissions?)\s+(?:emissions\s+)?(?:data|inventory|statement|figures|metrics)\b"
+    r"|\b(?:selected|reported|key|these|the|our|\d{4})?\s*(?:metrics|kpis|indicators)\b"
+)
+# says that something was NOT assured: "has not been subject to limited assurance", "no external assurance"
+_ASSURANCE_NEGATED_RE = re.compile(
+    r"\b(?:not|never)\s+(?:been\s+|yet\s+been\s+)?(?:subject(?:ed)?\s+to|covered\s+by|assured|verified|reviewed|audited)\b"
+    r"|\b(?:has|have|had|was|were|is|are)\s+not\b[^.;]{0,40}\bassur|\bno\s+(?:independent\s+|external\s+|third[- ]party\s+)?"
+    r"(?:assurance|verification)\b|\bwithout\s+(?:independent\s+|external\s+)?(?:assurance|verification)\b|\bunassured\b"
+)
+# never the sustainability disclosures, whatever else the sentence says
+_ASSURANCE_NOT_DISCLOSURE_RE = re.compile(
+    r"\besef\b|\bi?xbrl\b|\bdigital(?:ly)?\s+(?:format|tag\w*)|\bformat\s+that\b|\bcertif(?:y|ies|ied|ication|icate)\w*"
+    r"|\bassurance\s+(?:framework|scheme|standard\s+for\s+(?:mines|producers))\b"
+)
+# objects that are not the company's disclosures; they count only when the sustainability report itself is also named
+_ASSURANCE_OTHER_OBJECT_RE = re.compile(
+    r"\bproduction\b|\bproducts?\b|facilit(?:y|ies)|\bsites?\b|data\s+cent(?:er|re)s?|\bplants?\b|\bbuildings?\b|\bassets?\b"
+    r"|\bprojects?\b|\bcredits?\b|\boffsets?\b|\bgreen\s+(?:bond|financ\w+)|\bfinancial\s+statements\b|\bstatutory\s+accounts\b"
+    r"|\bconsolidated\s+(?:financial|accounts)\b|\bannual\s+accounts\b"
+)
+_THIRD_PARTY_RE = re.compile(r"third[- ]party|independent|external(?:ly)?\s+(?:auditor|assur|verif)|\bauditors?\b|assurance\s+provider|accredited")
 
 
 def detect_regulatory_reporting(text: str) -> list[str]:
     terms = load_rules()["reporting_rules"]["regulation_terms"]
     return [s for s in split_sentences(text) if matched_terms(s, terms)]
+
+
+# Reporting evidence must DISCLOSE sustainability information, not merely mention sustainability. Being on the
+# company's own website is not enough, and neither is a sustainability adjective in marketing text: "our products
+# are affordable, sustainable and offer striking results" discloses nothing. A sentence qualifies when it:
+#   (a) names a sustainability reporting artefact (sustainability / ESG / non-financial report or statement ...),
+#   (b) says the company reports, discloses or publishes a sustainability subject (emissions, ESG data, ...),
+#   (c) refers to sustainability reporting under a reporting framework or assurance, or
+#   (d) states a quantified sustainability metric for a period ("Scope 1 emissions fell 12% compared with 2024").
+_ESG_NOUN = (r"(?:sustainability|esg|climate|greenhouse\s+gas(?:es)?|ghg|(?:co2|carbon)\s+emissions|emissions|carbon\s+footprint|"
+             r"scope\s+[123]|non-financial|csr|corporate\s+(?:social\s+)?responsibility|human\s+rights|diversity|"
+             r"environmental\s+(?:impact|performance|data|information|footprint)|social\s+(?:impact|performance|data|information)|"
+             r"energy\s+(?:use|consumption)|water\s+(?:use|consumption|withdrawal)|waste\s+(?:generated|data)|health\s+and\s+safety)")
+_REPORT_ARTEFACT_RE = re.compile(
+    r"\b(?:sustainability|esg|csr|non-financial|environmental|climate|impact|responsibility|corporate\s+responsibility|"
+    r"integrated|annual\s+and\s+sustainability)\s+(?:report(?:s|ing)?|statements?|disclosures?|data|accounts|index|performance\s+report)\b",
+    re.IGNORECASE,
+)
+_REPORT_VERB = r"(?:report(?:s|ed|ing)?|disclos(?:e|es|ed|ing|ures?)|publish(?:es|ed|ing)?|communicat(?:e|es|ed)|account(?:s|ed)?\s+for)"
+_DISCLOSES_ESG_RE = re.compile(
+    rf"\b{_REPORT_VERB}\b(?:\s+[\w-]+){{0,6}}?\s+(?:on\s+|about\s+)?(?:its\s+|our\s+|the\s+company's\s+)?(?:[\w-]+\s+)?{_ESG_NOUN}\b"
+    rf"|\b{_ESG_NOUN}\b(?:\s+[\w-]+){{0,6}}?\s+(?:is|are|was|were|has\s+been|have\s+been)\s+(?:\w+\s+)?(?:reported|disclosed|published)\b",
+    re.IGNORECASE,
+)
+_FRAMEWORK_OR_ASSURANCE_RE = re.compile(
+    r"\b(?:gri|esrs|sasb|tcfd|issb|csrd|cdp)\b[^.]{0,80}\b(?:report\w*|disclos\w+|statement)\b"
+    r"|\b(?:report\w*|disclos\w+|statement)\b[^.]{0,80}\b(?:gri|esrs|sasb|tcfd|issb|csrd)\b"
+    r"|\b(?:limited|reasonable)\s+assurance\b[^.]{0,80}\b(?:sustainability|esg|non-financial|emissions?)\b",
+    re.IGNORECASE,
+)
+_ESG_METRIC_RE = re.compile(
+    r"\b(?:emissions?|ghg|greenhouse\s+gas|carbon\s+footprint|energy\s+(?:use|consumption|intensity)|renewable\s+(?:energy|electricity)|"
+    r"water\s+(?:use|consumption|withdrawal)|waste|recycl\w+|women|gender|injur\w+|lost[- ]time|ltifr|employee\s+turnover)\b",
+    re.IGNORECASE,
+)
+_ESG_FIGURE_RE = re.compile(r"\d(?:[\d.,\s]*)\s?(?:%|per\s?cent|percent|t\b|tonnes?|tco2e?|mwh|gwh|kwh)", re.IGNORECASE)
+_MARKETING_RE = re.compile(
+    r"\b(?:our|these|the)\s+(?:products?|solutions?|machines?|services?|offerings?)\s+(?:offer|provide|deliver|give|bring|are|is|help)\b"
+    r"|\b(?:buyers?|marketers?|customers?)\s+who\b|\bdecision-making\s+process(?:es)?\s+of\b|\bstriking\s+results\b",
+    re.IGNORECASE,
+)
+MIN_REPORTING_SENTENCE_WORDS = 6
+
+
+def reporting_statement(text: str) -> str | None:
+    """The first sentence that discloses sustainability information (rules (a)-(d) above). None otherwise."""
+    for sentence in split_sentences(text):
+        if len(sentence.split()) < MIN_REPORTING_SENTENCE_WORDS:
+            continue
+        if _REPORT_ARTEFACT_RE.search(sentence) or _DISCLOSES_ESG_RE.search(sentence) or _FRAMEWORK_OR_ASSURANCE_RE.search(sentence):
+            return sentence
+        quantified = (_ESG_METRIC_RE.search(sentence) and _ESG_FIGURE_RE.search(sentence)
+                      and (YEAR_RE.search(sentence) or CHANGE_VERB_RE.search(sentence)))
+        # a target says what the company wants to reach, not what it reports having reached
+        if quantified and not _MARKETING_RE.search(sentence) and not TARGET_WORDS_RE.search(sentence):
+            return sentence
+    return None
 
 
 # ---------------------------------------------------------------- targets (planning)
@@ -295,8 +420,9 @@ def _clean_unit(u: str | None) -> str | None:
 
 
 def _unit_from_label(label: str) -> str | None:
-    m = re.search(r"\(([^)]{1,25})\)", label)
-    return m.group(1).strip() if m else None
+    """'Energy use (MWh)' -> 'MWh'. With several brackets, the one that is a unit: 'Renewable electricity (PPAs) (MWh)'."""
+    groups = [g.strip() for g in re.findall(r"\(([^)]{1,25})\)", label)]
+    return next((g for g in groups if is_unit_only(g)), groups[0] if groups else None)
 
 
 def extract_series(text: str) -> list[Series]:
@@ -405,6 +531,25 @@ def _header_columns(line: str) -> list[int | None]:
     return columns
 
 
+def _looks_like_axis(values: list[float]) -> bool:
+    """An evenly spaced run of round numbers (100, 75, 50, 25): a chart's scale. Reported figures are not."""
+    if len(values) < 3:
+        return False
+    steps = {round(b - a, 6) for a, b in zip(values, values[1:])}
+    return len(steps) == 1 and abs(next(iter(steps))) >= 5 and all(v % 5 == 0 for v in values)
+
+
+def _clean_label(line: str) -> str:
+    """'Purchased electricity209' -> 'Purchased electricity': a footnote number printed against the last word."""
+    return re.sub(r"(?<=[A-Za-z)])\d{1,3}$", "", line.strip()).strip(" |:-–")
+
+
+def _is_row_label(line: str) -> bool:
+    """A table row's own name: words, no figures, not a unit, not a year header, not a sentence."""
+    return (bool(line) and _has_text(line) and not NUM_RE.search(line) and not is_unit_only(line) and not _is_year_line(line)
+            and not _is_prose(line) and len(line.split()) <= 2 * MAX_ROW_LABEL_WORDS)
+
+
 def _is_prose(line: str) -> bool:
     return len(line.split()) >= 10 and line.rstrip()[-1:] in ".!?:"
 
@@ -457,6 +602,11 @@ def _tables(lines: list[str], rejected: list[Series] | None = None) -> list[Seri
         rows_seen = 0
         # Label printed above a one-year-per-line header, values below it: the label precedes the header
         cells, after = _numeric_cells(lines, k, n)
+        if len(cells) == n and _looks_like_axis(cells):
+            # '100 / 75 / 50 / 25' under a chart's year labels: the figure's scale, not reported values
+            rejected.append(Series(lines[i - 1] if i > 0 else "", None, [], " ".join(lines[max(0, i - 1):after]), meta={"reason": "chart_axis"}))
+            i = after
+            continue
         if len(cells) == n and i > 0 and _has_text(lines[i - 1]) and not NUM_RE.search(lines[i - 1]):
             out.append(Series(lines[i - 1], _unit_from_label(lines[i - 1]), points(columns, cells),
                               " ".join(lines[i - 1:after])))
@@ -471,9 +621,20 @@ def _tables(lines: list[str], rejected: list[Series] | None = None) -> list[Seri
             if _has_text(label_part) and nums:
                 raw, label, cell_unit, seen = _row_cells(line, n)
                 label = label.strip(" |:-–")
-                if raw is not None and _has_text(label) and len(label.split()) <= MAX_ROW_LABEL_WORDS:
+                if raw is not None and is_unit_only(label):
+                    # 'Renewable electricity procured' on one line, 'MWh 14,313,200 16,565,400 ...' on the next
+                    above = _clean_label(lines[k - 1]) if k - 1 >= j else ""
+                    if _is_row_label(above):
+                        label, line = f"{above} ({label})", f"{above} {line}"
+                    else:
+                        rejected.append(Series(label, label, [], line, meta={"reason": "metric_label_missing"}))
+                        k += 1
+                        continue
+                if raw is not None and _has_text(label) and len(label.split()) <= 3 * MAX_ROW_LABEL_WORDS:
                     vals = [parse_number(x) for x in raw]
-                    if all(v is not None for v in vals) and not all(re.fullmatch(r"(?:19|20)\d{2}", x) for x in raw):
+                    if all(v is not None for v in vals) and _looks_like_axis(vals):
+                        rejected.append(Series(label, None, [], line, meta={"reason": "chart_axis"}))
+                    elif all(v is not None for v in vals) and not all(re.fullmatch(r"(?:19|20)\d{2}", x) for x in raw):
                         out.append(Series(label, _unit_from_label(label) or cell_unit, points(columns, vals), line))
                         rows_seen += 1
                     k += 1
@@ -484,8 +645,23 @@ def _tables(lines: list[str], rejected: list[Series] | None = None) -> list[Seri
                     continue
             if _has_text(line) and not nums:
                 cells, after = _numeric_cells(lines, k + 1, n)
+                if len(cells) == n and _looks_like_axis(cells):
+                    # '100 / 75 / 50 / 25' under a chart legend: the scale of a figure, not reported values
+                    rejected.append(Series(_clean_label(line), None, [], " ".join(lines[k:after]), meta={"reason": "chart_axis"}))
+                    k = after
+                    continue
                 if len(cells) == n:
-                    out.append(Series(line, _unit_from_label(line), points(columns, cells), " ".join(lines[k:after])))
+                    label, quote = _clean_label(line), " ".join(lines[k:after])
+                    if is_unit_only(label):
+                        # one cell per line: 'Purchased electricity' / 'MWh' / five values. The unit line belongs to
+                        # the label line right above it; without one, nobody can say what the values measure.
+                        above = _clean_label(lines[k - 1]) if k - 1 >= j else ""
+                        if not _is_row_label(above):
+                            rejected.append(Series(label, label, [], quote, meta={"reason": "metric_label_missing"}))
+                            k = after
+                            continue
+                        label, quote = f"{above} ({label})", f"{above} {quote}"
+                    out.append(Series(label, _unit_from_label(label), points(columns, cells), quote))
                     rows_seen += 1
                     k = after
                     continue
@@ -572,6 +748,30 @@ def _dedupe(series: list[Series]) -> list[Series]:
         seen.add(key)
         out.append(s)
     return out
+
+
+_UNIT_TOKEN_RE = re.compile(
+    r"^(?:[kmgt]?wh|[kmgtp]?j|%|t|kt|mt|tco2e?|tco₂e?|tonnes?|tons?|m3|m³|kg|g|l|ml|units?|number|no\.?|#|fte|hours?|h|"
+    r"msek|meur|musd|bsek|mnok|mdkk|ktco2e|mtco2e)$",
+    re.IGNORECASE,
+)
+_CURRENCIES = {"sek", "eur", "usd", "nok", "dkk", "gbp", "chf", "jpy", "cny"}
+
+
+def _is_unit_token(token: str) -> bool:
+    t = token.strip("()[],:;").lower()
+    return not t or t in _CURRENCIES or bool(_UNIT_TOKEN_RE.match(t))
+
+
+def is_unit_only(label: str) -> bool:
+    """'MWh', '(GWh)', '%', 'tCO2e': a unit says how a row is measured, never what it measures."""
+    tokens = [t for t in re.split(r"[\s/|]+", label) if t]
+    return bool(tokens) and all(_is_unit_token(t) for t in tokens)
+
+
+def label_without_units(label: str) -> str:
+    """The words of a row label that name the metric: units in brackets or on their own are dropped."""
+    return " ".join(t for t in re.split(r"\s+", re.sub(r"\([^)]{0,25}\)", " ", label)) if t and not _is_unit_token(t))
 
 
 def match_metric(label_and_context: str, factor: dict[str, Any]) -> dict[str, Any] | None:

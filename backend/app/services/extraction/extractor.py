@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -75,13 +76,20 @@ class Candidate:
 
 class FactExtractor:
     def __init__(self, llm: LLMProvider | None, assessment_year: int, allow_heuristic: bool = True,
-                 on_llm_call: Callable[[], None] | None = None):
+                 on_llm_call: Callable[[], None] | None = None, llm_budget: int | None = None):
         self.llm = llm
         self.year = assessment_year
         self.allow_heuristic = allow_heuristic
         self.use_llm = bool(llm and llm.is_available())
         self.warnings: list[str] = []
         self.llm_calls = 0
+        self.llm_seconds = 0.0
+        self.llm_budget = llm_budget  # None = no limit
+        self.budget_exhausted = 0  # passages that went to the deterministic extractor because the budget was spent
+        self.skipped_llm = {"overlap": 0, "deadline_passed": 0, "outside_window": 0}
+        self._sent: dict[tuple[str, str], set[str]] = {}  # sentences already put to the model, per factor x dimension
+        self.current_question: tuple[str, str] | None = None  # set by the caller
+        self.budget_cut: set[tuple[str, str]] = set()  # questions with a passage the model did not read
         self.llm_failures = 0
         self._on_llm_call = on_llm_call
         self.rules = load_rules()
@@ -94,11 +102,18 @@ class FactExtractor:
     def _ask(self, prompt: str, schema: dict[str, Any]) -> dict[str, Any] | None:
         if not self.use_llm or self.llm is None:
             return None
+        if self.llm_budget is not None and self.llm_calls >= self.llm_budget:
+            self.budget_exhausted += 1
+            if self.current_question:
+                self.budget_cut.add(self.current_question)
+            return None  # the caller falls back to deterministic extraction, which is verified like everything else
         self.llm_calls += 1
         if self._on_llm_call:
             self._on_llm_call()
+        started = time.perf_counter()
         try:
             raw = self.llm.complete_json(prompts.SYSTEM_PROMPT, prompt, schema=schema)
+            self.llm_seconds += time.perf_counter() - started
             return parse_llm_json(raw)
         except LLMUnavailableError as exc:
             self.use_llm = False
@@ -130,6 +145,11 @@ class FactExtractor:
             goal_sentences = [s for s in P.split_sentences(p.text) if is_goal_sentence(s, factor)]
             if not goal_sentences:
                 continue  # prefilter: no goal language about this factor -> no LLM call needed
+            if all(_deadline_has_passed(s, self.year) for s in goal_sentences):
+                self.skipped_llm["deadline_passed"] += 1
+                continue  # every goal here expired before the assessment year: none can be a current goal
+            if self._already_sent(factor_key, "planning", goal_sentences):
+                continue
             data = self._ask(prompts.planning_prompt(factor["label"], p.label, self._passage_text(p)), prompts.PLANNING_SCHEMA)
             if data is not None:
                 c = self._planning_from_llm(factor, p, data)
@@ -142,6 +162,27 @@ class FactExtractor:
             if self.allow_heuristic:
                 out.extend(self._planning_heuristic(factor, p, goal_sentences))
         return out
+
+    def _already_sent(self, factor_key: str, dimension: str, sentences: list[str]) -> bool:
+        """Overlapping chunks repeat sentences. When every candidate sentence of this passage was already put to the
+        model for the same question, asking again can only repeat that answer (and its evidence is deduplicated)."""
+        key = (factor_key, dimension)
+        seen = self._sent.setdefault(key, set())
+        normalized = {P.normalize_ws(s) for s in sentences}
+        if normalized <= seen:
+            self.skipped_llm["overlap"] += 1
+            return True
+        seen |= normalized
+        return False
+
+    def _all_outside_window(self, sentences: list[str], p: Passage) -> bool:
+        start = self.year - self.rules["lookback_years"] + 1
+        for s in sentences:
+            years = [y for y in P.find_years(s) if y <= self.year]
+            effective = max(years) if years else p.doc_year
+            if effective is None or effective >= start:
+                return False
+        return True
 
     def _planning_common(self, factor: dict[str, Any], p: Passage, sentence: str) -> dict[str, Any]:
         prules = self.rules["planning_rules"]
@@ -260,23 +301,37 @@ class FactExtractor:
             sentences = [
                 s for s in P.split_sentences(p.text)
                 if ACTIVITY_RE.search(s) and P.matched_terms(s, factor["keywords"]) and not re.search(r"\b(will|plan to|plans to|intend)\b", s, re.I)
-                and not gates.activity_not_performed(s) and not gates.external_actor_only(s)
+                and not gates.activity_not_performed(s) and not gates.external_actor_only(s) and not gates.external_purpose_only(s)
             ]
             if not sentences:
+                continue
+            if self._all_outside_window(sentences, p):
+                self.skipped_llm["outside_window"] += 1
+                continue  # every activity here is dated before the lookback window: none can count
+            if self._already_sent(factor_key, "execution", sentences):
                 continue
             data = self._ask(prompts.execution_prompt(factor["label"], p.label, self._passage_text(p)), prompts.EXECUTION_SCHEMA)
             if data is not None:
                 if not as_bool(data.get("activity_found")):
                     continue
                 quote = str(data.get("evidence_quote") or "").strip()
+                description = str(data.get("activity_description") or "").strip()
                 linked = bool(as_bool(data.get("linked_to_goal")))
                 notes = []
+                quote, mismatch = _align_activity_quote(description, quote, p.text, notes)
                 quote_in_source = bool(quote) and P.normalize_ws(quote) in P.normalize_ws(p.text)
                 if linked and not P.matched_terms(quote if quote_in_source else p.text, link_terms):
                     linked = False
                     notes.append("LLM linked the activity to a goal, but no goal/strategy wording was found; ignored.")
                 year = as_year(data.get("activity_year"))
-                facts = self._activity_facts(p, year, linked, data.get("activity_description"))
+                if year is not None and not _year_in(year, quote if quote_in_source else p.text):
+                    # the activity is in the text; the date the model gave it is not. An ungrounded date is dropped
+                    # (the document's year is used instead); it does not make the activity itself unverifiable.
+                    notes.append(f"The model dated the activity {year}, but that year is not in the source; the document year is used.")
+                    year = None
+                facts = self._activity_facts(p, year, linked, description or None)
+                if mismatch:
+                    facts["claim_quote_mismatch"] = True
                 method, model = self._llm_meta()
                 out.append(Candidate(factor_key, "execution", "activity", _activity_claim(factor["label"], facts, quote),
                                      facts, quote, p, method, model, as_confidence(data.get("confidence")), notes=notes))
@@ -312,13 +367,14 @@ class FactExtractor:
             # 1) deterministic series / relative changes
             aligned, unaligned = P.extract_series_with_rejections(p.text)
             for s in aligned:
-                metric = P.match_metric(s.metric_label, factor)
+                # the row's own label must name the metric: a unit ("MWh") or a table heading is not enough
+                metric = _row_metric(s, factor)
                 if metric is None:
                     continue
                 found_numeric = True
                 out.append(self._series_candidate(factor, p, s, metric, "regex", None, None))
             for s in unaligned[:MAX_UNALIGNED_ROWS_PER_PASSAGE]:
-                metric = P.match_metric(s.metric_label, factor)
+                metric = _row_metric(s, factor)
                 if metric is None:
                     continue
                 found_numeric = True  # the model would only guess the same alignment
@@ -357,7 +413,7 @@ class FactExtractor:
                                          {"statement": sent, "favorable": favorable, "terms": P.matched_terms(sent, prules["sector_leading_terms"])},
                                          sent, p, "regex"))
             # 3) LLM for prose the regexes could not structure
-            if not found_numeric and P.matched_terms(p.text, factor["keywords"]) and len(P.find_years(p.text)) >= 2:
+            if not found_numeric and P.matched_terms(p.text, factor["keywords"]) and _values_stated_with_years(p.text, factor):
                 data = self._ask(prompts.performance_prompt(factor["label"], p.label, self._passage_text(p)), prompts.PERFORMANCE_SCHEMA)
                 if data is not None and as_bool(data.get("metric_found")):
                     pts = []
@@ -389,7 +445,9 @@ class FactExtractor:
             "unit": s.unit, "points": [[y, v] for y, v in sorted(s.points)],
         }
         pts = ", ".join(f"{y}: {v:g}" for y, v in sorted(s.points))
-        return Candidate(factor["key"], "performance", "performance_series", f"{metric['name']} ({s.unit or 'unit n/a'}) \u2014 {pts}",
+        label = P.label_without_units(s.metric_label)[:90] or metric["name"]
+        unit = f" ({s.unit})" if s.unit and s.unit not in label else ""
+        return Candidate(factor["key"], "performance", "performance_series", f"{label}{unit} [{metric['name']}] \u2014 {pts}",
                          facts, s.quote, p, method, model, conf, extracted_unit=s.unit)
 
     # ------------------------------------------------------------------ reporting
@@ -401,17 +459,20 @@ class FactExtractor:
         for p in report_sources:
             if p.identity_basis == PARENT_BOUNDARY:
                 continue  # the parent's report is the parent's reporting
+            statement = P.reporting_statement(p.text)
             if p.source_type in REPORT_SOURCE_TYPES:
+                # the source is the company's company-wide report (classified from the document itself)
                 regular = p.doc_year is not None or bool(re.search(r"\b(annual|yearly|every year|each year)\b", p.text, re.I))
                 out.append(Candidate("reporting", "reporting", "report_published",
                                      f"Sustainability information published in '{p.source_title or 'report'}'"
                                      + (f" ({p.doc_year})" if p.doc_year else ""),
                                      {"public": p.is_public, "regular": regular, "report_type": p.source_type, "report_year": p.doc_year},
                                      p.text, p, "regex"))
-            elif p.source_type in OFFICIAL_SOURCE_TYPES:
+            elif p.source_type in OFFICIAL_SOURCE_TYPES and statement:
+                # a company page counts only for what it discloses about sustainability, not for being the company's page
                 out.append(Candidate("reporting", "reporting", "voluntary_disclosure",
-                                     "Sustainability information on company website",
-                                     {"public": True}, p.text, p, "regex"))
+                                     "Sustainability information disclosed on the company website",
+                                     {"public": True}, statement, p, "regex"))
         seen: set[tuple[str, str]] = set()
         assurance_llm_budget = 3  # the regex check covers the rest
         for p in passages:
@@ -423,8 +484,9 @@ class FactExtractor:
                     continue
                 seen.add(key)
                 out.append(Candidate("reporting", "reporting", "framework_reference",
-                                     f"{'Reports in accordance with / references' if fm.explicit else 'Mentions'} {fm.framework}",
-                                     {"framework": fm.framework, "explicit": fm.explicit,
+                                     f"{'Reports in accordance with' if fm.explicit else 'References' if fm.code_reference or fm.content_index else 'Mentions'} {fm.framework}",
+                                     {"framework": fm.framework, "explicit": fm.explicit, "code_reference": fm.code_reference,
+                                      "content_index": fm.content_index, "source_id": p.source_id,
                                       "level5_eligible": fm.framework in rules["level5_frameworks"], "public": p.is_public},
                                      fm.sentence, p, "regex"))
             for am in P.detect_assurance(p.text):
@@ -433,10 +495,12 @@ class FactExtractor:
                     continue
                 seen.add(key)
                 facts = {"sustainability_assurance": am.covers_sustainability, "provider": am.provider,
-                         "standard": am.standard, "assurance_level": am.level}
+                         "standard": am.standard, "assurance_level": am.level, "third_party": am.third_party}
                 method, model, conf, quote, notes = "regex", None, None, am.sentence, []
                 data = None
-                if assurance_llm_budget > 0:
+                # the model can only confirm what the keyword check found (both must agree), so a statement the
+                # check already refuses (a certified facility, verified credits) is not worth a model call
+                if assurance_llm_budget > 0 and am.covers_sustainability:
                     assurance_llm_budget -= 1
                     data = self._ask(prompts.assurance_prompt(p.label, self._passage_text(p)), prompts.ASSURANCE_SCHEMA)
                 if data is not None:
@@ -468,7 +532,88 @@ FORWARD_RE = re.compile(r"\b(will|aims? to|aiming to|plans? to|intends? to|commi
 def is_goal_sentence(s: str, factor: dict[str, Any]) -> bool:
     return (len(s.split()) >= 6 and bool(STRONG_GOAL_RE.search(s)) and bool(P.matched_terms(s, factor["keywords"]))
             and not ACTIVITY_RE.search(s) and not gates.is_inactive_goal(s) and not gates.external_goal_only(s)
+            and not gates.external_purpose_only(s)
             and not (P.CHANGE_VERB_RE.search(s) and not FORWARD_RE.search(s)))
+
+
+def _year_in(year: int, text: str) -> bool:
+    return re.search(rf"(?<!\d){year}(?!\d)", text) is not None
+
+
+def _align_activity_quote(description: str, quote: str, text: str, notes: list[str]) -> tuple[str, bool]:
+    """The finding (the model's description) must be what the quote says. If it is not, the verbatim sentence of
+    the passage that does state it replaces the quote; failing that, the pair is marked as mismatched (rejected
+    in verification). A nearby statement about something else is never used."""
+    if not description or not quote or gates.claim_supported_by_quote(description, quote):
+        return quote, False
+    sentence = gates.supporting_sentence(description, text)
+    if sentence and P.normalize_ws(sentence) in P.normalize_ws(text):
+        notes.append("The extraction quote did not state the finding; the source sentence that does was used instead.")
+        return sentence, False
+    notes.append("The extraction quote does not state the reported finding.")
+    return quote, True
+
+
+_INVERTED_LABEL_RE = re.compile(r"\b(?:reduc(?:ed|tion)|avoided|diverted|diversion|saved|savings|recovered|prevented)\b", re.IGNORECASE)
+_SHARE_UNITS_RE = re.compile(r"^(?:[kmgt]?wh|[kmgtp]?j|t|kt|mt|tco2e?|tonnes?)$", re.IGNORECASE)
+
+
+_SHARE_LABEL_RE = re.compile(r"\b(?:share|percentage|proportion|percent)\b|%", re.IGNORECASE)
+_INTENSITY_LABEL_RE = re.compile(r"\bper\b|\bintensity\b|/", re.IGNORECASE)
+# part of a total, not the total: 'renewable energy consumption' is not 'energy consumption'
+_COMPONENT_RE = re.compile(r"\b(?:renewable|non-renewable|fossil|nuclear|self-generated|purchased|on-site|by\s+source|from\s+(?:activities|sources))\b",
+                           re.IGNORECASE)
+
+
+def _is_share_metric(metric: dict[str, Any]) -> bool:
+    return bool(re.search(r"\bshare\b|coverage", metric["name"], re.IGNORECASE))
+
+
+def _row_metric(s: P.Series, factor: dict[str, Any]) -> dict[str, Any] | None:
+    """The configured metric a table row measures, judged by what the row's own label MEANS, not by which keyword
+    happens to be longest. A share is only a share metric; an absolute quantity is never one; a component of a total
+    is not the total; a per-unit figure is an intensity. When the meaning does not fit a configured metric: abstain."""
+    label = P.label_without_units(s.metric_label)
+    metric = P.match_metric(label, factor)
+    if metric is None:
+        return None
+    unit = (s.unit or "").strip().strip("()")
+    metrics = factor.get("metrics", [])
+    is_share = bool(_SHARE_LABEL_RE.search(s.metric_label)) or unit == "%"
+    if is_share and not _is_share_metric(metric):
+        renewable_share = next((m for m in metrics if _is_share_metric(m) and "renewable" in m["name"]), None)
+        if re.search(r"\brenewable\b", label, re.IGNORECASE) and not re.search(r"\bnon-renewable\b", label, re.IGNORECASE):
+            metric = renewable_share  # 'share of renewable sources in total energy consumption'
+        elif re.search(r"consumption|generated|landfill|use\b", metric["name"], re.IGNORECASE):
+            return None  # 'share of fossil sources in energy consumption' is not the consumption itself
+        if metric is None:
+            return None
+    elif not is_share and _is_share_metric(metric):
+        return None  # 'renewable energy production', 'MWh of renewable electricity': a quantity, not a share
+    if _INTENSITY_LABEL_RE.search(label) and "intensity" not in metric["name"]:
+        intensity = next((m for m in metrics if "intensity" in m["name"] and re.search(r"\w+", m["name"])
+                          and m["name"].split()[0] in metric["name"]), None)
+        if intensity is None:
+            return None
+        metric = intensity  # 'energy consumption per revenue' is an energy intensity
+    if re.search(r"consumption", metric["name"], re.IGNORECASE) and _COMPONENT_RE.search(label):
+        return None  # 'total fossil / renewable / purchased energy consumption' is a part, not the total
+    if metric["better"] == "lower" and _INVERTED_LABEL_RE.search(label):
+        return None  # 'waste diverted / reduced / avoided' rises when things improve: the direction is not the metric's
+    if _is_share_metric(metric) and _SHARE_UNITS_RE.match(unit) and "%" not in s.metric_label:
+        return None
+    return metric
+
+
+def _values_stated_with_years(text: str, factor: dict[str, Any]) -> bool:
+    """Could a model-read series ever be accepted here? Verification needs values tied to their years, so a
+    sentence must name a metric of this factor next to at least two years and two other numbers."""
+    for sentence in P.split_sentences(text):
+        years = set(P.find_years(sentence))
+        others = [n for n in P.NUM_RE.findall(P.YEAR_RE.sub(" ", sentence))]
+        if len(years) >= 2 and len(others) >= 2 and P.match_metric(sentence, factor):
+            return True
+    return False
 
 
 def _deadline_has_passed(sentence: str, year: int) -> bool:
@@ -522,7 +667,7 @@ def passage_signal(factor_key: str, dimension: str, text: str) -> int:
         return sum(1 for s in sentences if is_goal_sentence(s, factor))
     if dimension == "execution":
         return sum(1 for s in sentences if ACTIVITY_RE.search(s) and P.matched_terms(s, factor["keywords"]) and not FUTURE_RE.search(s)
-                   and not gates.activity_not_performed(s) and not gates.external_actor_only(s))
+                   and not gates.activity_not_performed(s) and not gates.external_actor_only(s) and not gates.external_purpose_only(s))
     if dimension == "performance":
         series = P.extract_series(text) + P.extract_from_to_changes(text, None) + P.extract_relative_changes(text, None)
         return sum(2 for s in series if P.match_metric(s.metric_label + " " + s.quote, factor)) + (1 if len(set(P.find_years(text))) >= 2 else 0)

@@ -36,6 +36,25 @@ def decide_reporting_level(s: dict[str, Any]) -> tuple[int, str, list[str]]:
     return 1, "R1_NO_REPORTING_EVIDENCE", ["No sustainability reporting was found in the reviewed sources."]
 
 
+MIN_CODE_REFERENCES_FOR_ADOPTION = 3
+
+
+def _adoption_shown_by_references(verified: list[EvidenceItem], already: set) -> list[EvidenceItem]:
+    """No single citation of a framework shows that the company reports under it. A content index for the framework
+    together with at least three citations of its disclosure codes in the same document does: that is what a
+    framework-based report looks like. Returns those items, for frameworks not already shown by an explicit statement."""
+    refs = [e for e in verified if e.claim_type == "framework_reference" and e.facts.get("level5_eligible")
+            and e.facts.get("framework") not in already]
+    out: list[EvidenceItem] = []
+    for (framework, source) in {(e.facts.get("framework"), e.source_id) for e in refs}:
+        same = [e for e in refs if e.facts.get("framework") == framework and e.source_id == source]
+        index = [e for e in same if e.facts.get("content_index")]
+        codes = [e for e in same if e.facts.get("code_reference")]
+        if index and len(codes) >= MIN_CODE_REFERENCES_FOR_ADOPTION:
+            out += index[:1] + codes[:MIN_CODE_REFERENCES_FOR_ADOPTION]
+    return out
+
+
 REASONS = {
     "R6_INDEPENDENT_ASSURANCE": "Public framework-based sustainability reporting with independent third-party assurance.",
     "R5_RECOGNISED_FRAMEWORK": "Public sustainability reporting explicitly follows a recognised reporting framework.",
@@ -51,9 +70,13 @@ def score_reporting(evidence: list[EvidenceItem]) -> ScoreResult:
     public_regular = [e for e in reports if e.facts.get("public") and e.facts.get("regular")]
     voluntary = [e for e in verified if e.claim_type == "voluntary_disclosure"] + [e for e in reports if e not in public_regular]
     frameworks = [e for e in verified if e.claim_type == "framework_reference" and e.facts.get("explicit") and e.facts.get("level5_eligible")]
+    frameworks += _adoption_shown_by_references(verified, {e.facts.get("framework") for e in frameworks})
     framework_mentions = [e for e in verified if e.claim_type == "framework_reference" and e not in frameworks]
+    # assurance of the sustainability disclosures by a qualified third party: named, by its standard, or stated as
+    # third-party / independent assurance in the statement itself. A certified site or verified credit never counts
+    # (sustainability_assurance is false for those).
     assurance = [e for e in verified if e.claim_type == "assurance_statement" and e.facts.get("sustainability_assurance")
-                 and (e.facts.get("provider") or e.facts.get("standard"))]
+                 and (e.facts.get("provider") or e.facts.get("standard") or e.facts.get("third_party"))]
     regulatory = [e for e in verified if e.claim_type == "regulatory_reporting"]
 
     signals = {
@@ -80,7 +103,7 @@ def score_reporting(evidence: list[EvidenceItem]) -> ScoreResult:
         "framework": Condition("Recognised framework", MET if frameworks else NOT_FOUND, [e.id for e in frameworks][:5],
                                ", ".join(sorted({e.facts.get("framework") for e in frameworks})) or None),
         "assurance": Condition("Independent assurance", MET if assurance else NOT_FOUND, [e.id for e in assurance][:5],
-                               ", ".join(sorted({e.facts.get("provider") or e.facts.get("standard") for e in assurance})) or None),
+                               ", ".join(sorted({e.facts.get("provider") or e.facts.get("standard") or "third party" for e in assurance})) or None),
     }
     if framework_mentions and not frameworks:
         r.notes.append("Frameworks are mentioned but no explicit statement of reporting in accordance with / with reference to them was found.")

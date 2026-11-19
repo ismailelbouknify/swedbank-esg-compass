@@ -111,13 +111,20 @@ def test_both_search_paths_call_the_same_gate_before_any_processing(client, web,
     web[wrong] = ("application/pdf", _report_pdf("Bluefin Foods Ltd"))
     results = [(good, f"{NAME} sustainability report 2025"), (wrong, f"{NAME} sustainability report 2024")]
     checked: list[str] = []
-    real_gate = discovery.apply_source_identity
+    real_gate, real_precheck = discovery.apply_source_identity, discovery.precheck_pdf_identity
 
     def recording_gate(db, a, s):
         checked.append(s.url)
         return real_gate(db, a, s)
 
+    def recording_precheck(db, a, s, title, text):
+        ok = real_precheck(db, a, s, title, text)
+        if not ok:
+            checked.append(s.url)  # refused from its first pages by the same identity rules: never parsed in full
+        return ok
+
     monkeypatch.setattr(discovery, "apply_source_identity", recording_gate)
+    monkeypatch.setattr(discovery, "precheck_pdf_identity", recording_precheck)
     search = Search(first=results) if found_by == "normal" else Search(first=[], later=results)
     aid = _create(client)
     run_assessment(aid, llm=FakeLLM(), search=search)
