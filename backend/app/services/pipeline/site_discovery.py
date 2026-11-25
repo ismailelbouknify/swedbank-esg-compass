@@ -11,13 +11,10 @@ from __future__ import annotations
 
 import html
 import re
-from dataclasses import dataclass, field
-from urllib.parse import urljoin, urlparse
-from urllib.robotparser import RobotFileParser
+from urllib.parse import urlparse
 
 from app.services.extraction.patterns import YEAR_RE
-
-ROBOTS_AGENT = "ESG-Assessment-MVP"  # the product token of safe_fetch.USER_AGENT
+from app.services.security.robots import ROBOTS_AGENT, SiteRules, parse_robots  # noqa: F401 — re-exported
 MAX_SITEMAP_LOCS = 50_000  # the sitemap protocol's own limit per file
 
 # Address words that point at the pages and documents an ESG assessment needs, by weight
@@ -33,28 +30,6 @@ _WEAK = ("career", "jobs", "job-", "vacanc", "press-release", "/news/", "/event"
          "interim-report", "interim_report", "quarterly", "-q1-", "-q2-", "-q3-", "/q1-", "/q2-", "/q3-")
 _SKIP_SUFFIXES = (".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".mp4", ".mp3", ".zip", ".gz", ".xlsx", ".xls",
                   ".docx", ".doc", ".pptx", ".ppt", ".css", ".js", ".ico", ".woff", ".woff2", ".json", ".xml", ".txt")
-
-
-@dataclass
-class SiteRules:
-    """robots.txt for one host: what may be fetched, and the sitemaps it names."""
-    parser: RobotFileParser | None = None
-    sitemaps: list[str] = field(default_factory=list)
-
-    def allows(self, url: str) -> bool:
-        return self.parser is None or self.parser.can_fetch(ROBOTS_AGENT, url)
-
-
-def parse_robots(text: str, base_url: str) -> SiteRules:
-    parser = RobotFileParser()
-    lines = text.splitlines()
-    parser.parse(lines)
-    sitemaps = []
-    for line in lines:
-        key, _, value = line.partition(":")
-        if key.strip().lower() == "sitemap" and value.strip():
-            sitemaps.append(urljoin(base_url, value.strip()))
-    return SiteRules(parser, list(dict.fromkeys(sitemaps)))
 
 
 _LOC = re.compile(r"<(?:\w+:)?loc>\s*([^<\s]+)\s*</(?:\w+:)?loc>", re.I)

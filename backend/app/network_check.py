@@ -187,7 +187,7 @@ def check_fetch(url: str) -> bool:
     print(f"\nWebsite retrieval: {url}")
     started = time.monotonic()
     try:
-        res = fetch(url, expect="any")
+        res = fetch(url, expect="any", robots_txt="typed_address")
     except SourceRejection as exc:
         _line("Result", f"FAILED ({exc.code}) after {time.monotonic() - started:.1f}s")
         print(f"  {EXPLANATIONS.get(exc.code, 'The application refused or could not read this source.')}")
@@ -274,7 +274,7 @@ def check_website_discovery(url: str) -> bool:
 
     print(f"\nOfficial-site discovery: {url}")
     try:
-        home = fetch(url, expect="html")
+        home = fetch(url, expect="html", robots_txt="typed_address")
     except SourceRejection as exc:
         _line("Homepage", f"FAILED ({exc.code})")
         print(f"  {EXPLANATIONS.get(exc.code, 'The site could not be read.')}")
@@ -284,7 +284,7 @@ def check_website_discovery(url: str) -> bool:
     base = f"{parts.scheme}://{parts.netloc}/"
     _line("Homepage", f"OK ({home.final_url})")
     try:
-        rules = sd.parse_robots(fetch(base + "robots.txt", expect="text").content.decode("utf-8", "replace"), base)
+        rules = sd.parse_robots(fetch(base + "robots.txt", expect="text", robots_txt="off").content.decode("utf-8", "replace"), base)
         _line("robots.txt", f"read; {len(rules.sitemaps)} sitemap(s) named")
     except SourceRejection as exc:
         rules = sd.SiteRules()

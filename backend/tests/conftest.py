@@ -40,6 +40,19 @@ def _db():
 
 
 @pytest.fixture(autouse=True)
+def _robots_txt(request, monkeypatch):
+    """robots.txt is enforced in tests marked `robots`. Elsewhere the mock sites have no robots.txt route, so the check
+    is switched off there instead of every handler answering robots.txt; the cache never carries over."""
+    from app.services.security import robots
+
+    robots.cache.clear()
+    if request.node.get_closest_marker("robots") is None:
+        monkeypatch.setattr(robots, "check", lambda url, fetch_text: None)
+    yield
+    robots.cache.clear()
+
+
+@pytest.fixture(autouse=True)
 def _no_host_proxy_settings(monkeypatch):
     """Tests never read this computer's Windows proxy settings (PAC / WPAD); tests that need them set them."""
     from app.services.search import providers

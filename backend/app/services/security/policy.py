@@ -19,6 +19,8 @@ PRIVATE_IP = "private_ip"
 EXTERNAL_FETCH_DISABLED = "external_fetch_disabled"
 # Redirects
 TOO_MANY_REDIRECTS = "too_many_redirects"
+# The site's robots.txt asks automated clients not to fetch the address (or the site answers robots.txt with 5xx)
+ROBOTS_DISALLOWED = "robots_disallowed"
 # Content policy
 DOWNLOAD_SIZE_LIMIT_EXCEEDED = "download_size_limit_exceeded"
 INVALID_CONTENT_TYPE = "invalid_content_type"
@@ -63,6 +65,7 @@ _AUDIT_EVENTS = {
     UNSAFE_PORT: "unsafe_url_rejected",
     PRIVATE_IP: "private_ip_rejected",
     TOO_MANY_REDIRECTS: "redirect_rejected",
+    ROBOTS_DISALLOWED: "robots_disallowed",
     DOWNLOAD_SIZE_LIMIT_EXCEEDED: "download_size_limit_exceeded",
     INVALID_CONTENT_TYPE: "invalid_content_type",
     INVALID_PDF_SIGNATURE: "invalid_pdf_signature",
@@ -106,7 +109,7 @@ def is_security_rejection(code: str) -> bool:
 
 
 def audit_event_for(exc: SourceRejection) -> str:
-    if exc.redirected and is_security_rejection(exc.code):
+    if exc.redirected and is_security_rejection(exc.code) and exc.code != ROBOTS_DISALLOWED:
         return "redirect_rejected"
     return _AUDIT_EVENTS.get(exc.code, "external_source_rejected")
 

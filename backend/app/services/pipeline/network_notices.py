@@ -54,6 +54,9 @@ STOPPED_MESSAGE = ("Automatic web access was stopped for this analysis after rep
                    "analysis continued with the sources available.")
 SEARCH_STOPPED_MESSAGE = ("Web search was stopped for this analysis after repeated failures. Website and document "
                           "retrieval continued separately.")
+ROBOTS_MESSAGE = ("Some pages or documents were not read because the website asks automated tools not to read them "
+                  "(robots.txt). This is respected. Gaps that depend on them are shown as not assessed, not as missing "
+                  "company activity. " + MANUAL_UPLOAD_HINT)
 SIZE_LIMIT_MESSAGE = ("A document was larger than the configured size limit (MAX_DOWNLOAD_MB) and was not read. "
                       + MANUAL_UPLOAD_HINT)
 PAGE_LIMIT_MESSAGE = ("A document had more pages than the configured limit (MAX_PDF_PAGES) and was not read. "
@@ -98,6 +101,8 @@ def network_notices(web: WebAccessState) -> list[str]:
         out.append(STOPPED_MESSAGE)
     elif web.search_stopped and not web.search_declined:
         out.append(SEARCH_STOPPED_MESSAGE)
+    if web.issues[policy.ROBOTS_DISALLOWED]:
+        out.append(ROBOTS_MESSAGE)
     if web.issues[policy.DOWNLOAD_SIZE_LIMIT_EXCEEDED]:
         out.append(SIZE_LIMIT_MESSAGE)
     if web.issues[policy.PDF_PAGE_LIMIT_EXCEEDED]:
@@ -121,6 +126,7 @@ def network_audit_details(web: WebAccessState) -> dict:
         "official_sites_explored": sorted(d for d in web.sites_explored if d),
         "official_site_sources_read": web.site_pages_read,
         "robots_txt_skipped": web.robots_skipped,
+        "robots_txt_refused_fetches": web.issues[policy.ROBOTS_DISALLOWED],
     }
 
 

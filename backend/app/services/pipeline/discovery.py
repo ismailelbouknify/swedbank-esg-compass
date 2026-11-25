@@ -34,7 +34,7 @@ from app.services.pipeline.source_gate import (
 )
 from app.services.extraction.patterns import YEAR_RE
 from app.services.search.base import SearchProvider, SearchResult, build_factor_recovery_queries, build_queries, build_recovery_queries
-from app.services.security import network, policy
+from app.services.security import network, policy, robots
 from app.services.security.policy import SourceRejection
 from app.services.security.safe_fetch import FetchResult, fetch, source_deadline
 from app.services.security.url_validator import UnsafeURLError, validate_external_url
@@ -326,6 +326,12 @@ def _download_into(db: Session, s: Source, report: DiscoveryReport, expect: str 
     return res if s.status != "REJECTED" else None
 
 
+def _not_counted(s: Source) -> bool:
+    """Sources that leave the budget for the next candidate: another company's document, or an address the site's
+    robots.txt excludes (recorded as REJECTED with that reason, never read)."""
+    return bool(s.rejection_reason) or s.fetch_outcome == policy.ROBOTS_DISALLOWED
+
+
 def _identical_document(db: Session, s: Source, sha256: str) -> Source | None:
     """A source of this assessment already read whose content is byte-identical."""
     from sqlalchemy import select
@@ -369,8 +375,8 @@ class _Pass:
             source = _new_source(db, a, link, label[:300] or link.rsplit("/", 1)[-1] or link, stype, official, f"{REPORT_LINK_VIA} {via}"[:255])
             self.progress(f"Downloading primary report: {link}")
             res = _download_into(db, source, self.report)
-            if source.rejection_reason:
-                continue  # a wrong-company document does not use up the budget
+            if _not_counted(source):
+                continue  # a wrong-company or robots-excluded document does not use up the budget
             if is_pdf:
                 self.pdf_budget -= 1
             else:
@@ -409,8 +415,8 @@ class _Pass:
             s = _new_source(db, a, r.url, r.title or host, stype, official, f"search: {r.query}")
             self.progress(f"Downloading {r.title or r.url}")
             res = _download_into(db, s, report)
-            if s.rejection_reason:
-                continue  # a wrong-company document does not use up the budget
+            if _not_counted(s):
+                continue  # a wrong-company or robots-excluded document does not use up the budget
             taken += 1
             if is_pdf:
                 self.pdf_budget -= 1
@@ -480,7 +486,7 @@ def discover(db: Session, a: Assessment, provider: SearchProvider, do_search: bo
 
     # 1) official website (if provided): homepage + a few ESG-relevant links, then its navigation and sitemaps
     if company.website and settings.enable_external_fetch:
-        home = _read_company_website(run, company.website, "company website")
+        home = _read_company_website(run, company.website, "company website", typed=True)
         if home is not None:
             _explore_official_site(run, *home)
         else:  # the analyst's address was tried: its domain is not tried again under other addresses
@@ -535,8 +541,10 @@ def explore_validated_official_site(run: "_Pass") -> None:
     report.warnings.append("Company website could not be fetched: official_domain_unreachable")
 
 
-def _read_company_website(run: "_Pass", url: str, via: str, quiet: bool = False) -> tuple[FetchResult, HtmlContent] | None:
-    """The homepage plus a few ESG-relevant links on it. Returns the homepage, or None when it could not be read."""
+def _read_company_website(run: "_Pass", url: str, via: str, quiet: bool = False,
+                          typed: bool = False) -> tuple[FetchResult, HtmlContent] | None:
+    """The homepage plus a few ESG-relevant links on it. Returns the homepage, or None when it could not be read.
+    `typed`: the address the analyst entered, fetched as a browser would (its redirects still honour robots.txt)."""
     db, a, report, progress = run.db, run.a, run.report, run.progress
     settings = get_settings()
     company = a.company
@@ -547,7 +555,7 @@ def _read_company_website(run: "_Pass", url: str, via: str, quiet: bool = False)
         db.commit()
         fetch_started = time.monotonic()
         try:
-            home = fetch(url, expect="html")
+            home = fetch(url, expect="html", robots_txt="typed_address" if typed else "enforce")
         except SourceRejection as exc:
             report.web.record_fetch(exc.code)
             raise
@@ -583,8 +591,8 @@ def _read_company_website(run: "_Pass", url: str, via: str, quiet: bool = False)
             s = _new_source(db, a, link, link.rsplit("/", 1)[-1] or link, stype, official, "link on company website")
             progress(f"Downloading {link}")
             res = _download_into(db, s, report)
-            if s.rejection_reason:
-                continue  # a wrong-company document does not use up the budget
+            if _not_counted(s):
+                continue  # a wrong-company or robots-excluded document does not use up the budget
             if is_pdf:
                 run.pdf_budget -= 1
             else:
@@ -633,14 +641,19 @@ def _fetch_site_text(run: "_Pass", url: str) -> tuple[str | None, str]:
     return res.content.decode("utf-8", errors="replace"), "ok"
 
 
-def _read_robots(run: "_Pass", base: str) -> site_discovery.SiteRules | None:
-    """The site's robots.txt rules; None when the site asks automated clients to keep out for now (server error)."""
-    text, outcome = _fetch_site_text(run, base + "robots.txt")
-    if text is not None:
-        return site_discovery.parse_robots(text, base)
-    if outcome.startswith(policy.HTTP_ERROR) and "HTTP 5" in outcome:
-        return None  # RFC 9309: an unreachable robots.txt (5xx) means "do not crawl" for now
-    return site_discovery.SiteRules()  # none published (404 and similar): no restrictions stated
+def _read_robots(run: "_Pass", base: str) -> robots.SiteRules | None:
+    """The site's robots.txt rules from the shared per-origin cache (the same rules safe_fetch enforces); None when
+    the site is to be left alone for now (robots.txt answered 5xx) or robots.txt could not be fetched."""
+    def fetch_text(robots_url: str) -> str:
+        return fetch(robots_url, expect="text", robots_txt="off").content.decode("utf-8", errors="replace")
+
+    run.db.commit()
+    try:
+        rules = robots.cache.rules_for(base, fetch_text)
+    except SourceRejection as exc:
+        run.report.web.record_fetch(exc.code)
+        return None
+    return None if rules.disallow_all else rules
 
 
 def _sitemap_urls(run: "_Pass", base: str, rules: site_discovery.SiteRules, domain: str) -> tuple[list[str], int]:
@@ -705,8 +718,8 @@ def _explore_official_site(run: "_Pass", home: FetchResult, content: HtmlContent
         s = _new_source(db, a, url, url.rstrip("/").rsplit("/", 1)[-1] or url, stype, official, "official website (navigation/sitemap)")
         run.progress(f"Downloading {url}")
         res = _download_into(db, s, report)
-        if s.rejection_reason:
-            continue  # a wrong-company document does not use up the budget
+        if _not_counted(s):
+            continue  # a wrong-company or robots-excluded document does not use up the budget
         read += 1
         if is_pdf:
             stage.pdf_budget -= 1

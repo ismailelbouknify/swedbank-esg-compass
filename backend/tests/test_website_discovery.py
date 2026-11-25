@@ -23,6 +23,8 @@ from tests.test_security import (  # noqa: F401 — fixtures used by name
     COMPANY, SITE, _assessment, _events, _no_sleep_no_scanner, _run, _sources, client_for, configure, dns,
 )
 
+pytestmark = pytest.mark.robots  # these mock sites serve robots.txt: it is enforced as in production
+
 DOMAIN = "nordvikcomponents.example"
 PAGE = ("<html><head><title>Nordvik Components AB - {title}</title></head><body><h1>{title}</h1><p>"
         + "Nordvik Components AB sustainability work: energy, climate, diversity and data security. " * 15
@@ -322,7 +324,9 @@ def test_a_refusal_pauses_searching_without_further_requests(dns, configure, res
         assert p.search("a", 5) == [] and p.last_error == code
         assert providers.pacer.cooldown_remaining() > 0
         assert p.search("b", 5) == [] and p.last_error == policy.SEARCH_REFUSED
-    assert len(calls) == 1, "nothing is sent during the cool-down"
+    queries = [r for r in calls if r.url.path != "/robots.txt"]
+    assert len(queries) == 1, "nothing is sent during the cool-down"
+    assert len(calls) - len(queries) <= 1, "the search service's robots.txt is read once, then cached"
 
 
 def test_ddgs_client_rate_limit_is_recognised():

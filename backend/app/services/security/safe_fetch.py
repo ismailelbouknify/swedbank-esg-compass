@@ -15,7 +15,7 @@ from urllib.parse import urljoin
 import httpx
 
 from app.core.config import Settings, get_settings
-from app.services.security import network, policy, windows_proxy
+from app.services.security import network, policy, robots, windows_proxy
 from app.services.security.content_validator import (
     PDF_SIGNATURE,
     classify_content_type,
@@ -74,11 +74,14 @@ def build_client(proxy: str | None = None, proxy_headers: dict[str, str] | None 
 
 
 def fetch(url: str, *, expect: str = "any", client: httpx.Client | None = None, deadline: float | None = None,
-          purpose: str = "retrieval") -> FetchResult:
+          purpose: str = "retrieval", robots_txt: str = "enforce") -> FetchResult:
     """Retrieve one public PDF or HTML page into memory. `expect` is 'pdf', 'html', 'any', or 'text' for a small
     text document such as robots.txt or a sitemap (never a PDF; HTML page size limit).
     `purpose='search'` is a search-results page: it is governed by ENABLE_WEB_SEARCH instead of ENABLE_EXTERNAL_FETCH,
     and goes through exactly the same proxy, sign-in, certificate, address and size checks.
+    `robots_txt`: 'enforce' (default) checks the site's robots.txt before every request, redirects included;
+    'typed_address' skips it for the first request only, for an address a person entered; 'off' is only for
+    fetching robots.txt itself.
     Raises FetchError, whose `code` says why; nothing is written to disk."""
     settings = get_settings()
     allowed = settings.enable_web_search if purpose == "search" else settings.enable_external_fetch
@@ -90,7 +93,7 @@ def fetch(url: str, *, expect: str = "any", client: httpx.Client | None = None, 
         attempt = 0
         while True:  # bounded: every path either returns, raises, or increments towards max_http_retries
             try:
-                return _follow_redirects(clients, url, expect, deadline, settings)
+                return _follow_redirects(clients, url, expect, deadline, settings, purpose, robots_txt)
             except FetchError as exc:
                 wait = RETRY_BACKOFF_SECONDS * (2 ** attempt)
                 if not exc.retryable or attempt >= settings.max_http_retries or time.monotonic() + wait >= deadline:
@@ -162,9 +165,11 @@ def _check_deadline(deadline: float) -> None:
         raise FetchError(policy.SOURCE_TIMEOUT, "Source processing time limit reached")
 
 
-def _follow_redirects(clients: _Clients, url: str, expect: str, deadline: float, settings: Settings) -> FetchResult:
+def _follow_redirects(clients: _Clients, url: str, expect: str, deadline: float, settings: Settings,
+                      purpose: str = "retrieval", robots_txt: str = "enforce") -> FetchResult:
     """Redirects to any public host are followed (corporate site -> CDN or filing host is normal);
-    each target is validated again, so a redirect can never reach a local or internal address."""
+    each target is validated again, so a redirect can never reach a local or internal address, and each target's
+    robots.txt is honoured."""
     current = url
     for hop in range(settings.max_redirects + 1):
         _check_deadline(deadline)
@@ -173,6 +178,8 @@ def _follow_redirects(clients: _Clients, url: str, expect: str, deadline: float,
             target = validate_external_url(current, allow_unresolved=proxy is not None)
         except UnsafeURLError as exc:
             raise FetchError(exc.code, str(exc), retryable=exc.retryable, redirected=hop > 0) from exc
+        if robots_txt == "enforce" or (robots_txt == "typed_address" and hop > 0):
+            _check_robots(clients, current, deadline, purpose, redirected=hop > 0)
         try:
             client, resp = _send_route(clients, proxy, target)
             try:
@@ -199,6 +206,18 @@ def _follow_redirects(clients: _Clients, url: str, expect: str, deadline: float,
         except (httpx.InvalidURL, ValueError) as exc:  # malformed Location or host
             raise FetchError(policy.UNSAFE_URL, "Malformed URL", redirected=hop > 0) from exc
     raise FetchError(policy.TOO_MANY_REDIRECTS, f"More than {settings.max_redirects} redirects", redirected=True)
+
+
+def _check_robots(clients: _Clients, url: str, deadline: float, purpose: str, redirected: bool) -> None:
+    """robots.txt of the target's origin (cached), fetched through this same transport: proxy, sign-in, certificates."""
+    def fetch_text(robots_url: str) -> str:
+        res = fetch(robots_url, expect="text", client=clients.given, deadline=deadline, purpose=purpose, robots_txt="off")
+        return res.content.decode("utf-8", errors="replace")
+
+    try:
+        robots.check(url, fetch_text)
+    except SourceRejection as exc:
+        raise FetchError(exc.code, str(exc), redirected=redirected) from exc
 
 
 def _is_407(exc: httpx.ProxyError) -> bool:
