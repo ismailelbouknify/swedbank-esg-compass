@@ -13,7 +13,7 @@ import html
 import re
 from urllib.parse import urlparse
 
-from app.services.extraction.patterns import YEAR_RE
+from app.services.documents.text_utils import YEAR_RE
 from app.services.security.robots import ROBOTS_AGENT, SiteRules, parse_robots  # noqa: F401 — re-exported
 MAX_SITEMAP_LOCS = 50_000  # the sitemap protocol's own limit per file
 

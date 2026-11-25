@@ -1,28 +1,64 @@
 """Source coverage states, one bounded recovery search, entity resolution and primary-document resolution.
 No network: DNS and HTTP are mocked. All companies are fictional."""
+
+
 from __future__ import annotations
+
 
 import socket
 
+
 import httpx
+
+
 import pymupdf
+
+
 import pytest
+
+
 from sqlalchemy import select
 
+
 from app.core.config import get_settings
+
+
 from app.db.session import SessionLocal
+
+
 from app.models.entities import Assessment, Evidence, Recommendation, Source
+
+
 from app.services.company.resolution import AMBIGUOUS, identity_from_profile, resolve_company
+
+
 from app.services.company.source_identity import CompanyIdentity, assess_source_identity
+
+
 from app.services.documents.html_extractor import extract_html
+
+
 from app.services.pipeline import discovery
+
+
 from app.services.pipeline.coverage import INSUFFICIENT_COVERAGE_MESSAGE, INSUFFICIENT_SOURCE_COVERAGE, NO_EVIDENCE_FOUND, NOT_ASSESSED_LEVEL
+
+
 from app.services.pipeline.runner import run_assessment
+
+
 from app.services.search.base import NullSearchProvider, SearchProvider, SearchResult, build_recovery_queries
+
+
 from app.services.security import safe_fetch
+
+
 from tests.conftest import FakeLLM
 
+
 NAME = "Northstar Manufacturing AB"
+
+
 SITE = "https://www.northstarmanufacturing.example"
 
 
@@ -31,6 +67,8 @@ def _page(title: str, sentences: str, links: str = "") -> str:
 
 
 ABOUT = "Northstar Manufacturing reports on its sustainability and climate work every year, and Northstar Manufacturing publishes this openly. " * 4
+
+
 ENERGY_PAGE = _page("Energy | Northstar Manufacturing", ABOUT + "We aim to reduce energy consumption by 30% by 2030 compared with a 2020 baseline.")
 
 
@@ -103,7 +141,6 @@ def _state(aid):
 REPORT_URL = f"{SITE}/sustainability-report-2025.pdf"
 
 
-# ---------------------------------------------------------------- recovery
 def test_zero_search_results_trigger_one_recovery_search_that_finds_valid_sources(client, web):
     web[REPORT_URL] = ("application/pdf", _report_pdf())
     search = Search(first=[], later=[(REPORT_URL, f"{NAME} sustainability report")])
@@ -197,7 +234,6 @@ def test_official_domain_source_is_taken_before_a_secondary_source(client, web):
     assert by_url[REPORT_URL].priority < by_url[secondary].priority
 
 
-# ---------------------------------------------------------------- coverage states
 def test_zero_sources_is_insufficient_coverage_not_no_evidence(client, web):
     aid = _create(client)
     run_assessment(aid, llm=FakeLLM(), search=Search())
@@ -293,15 +329,22 @@ def test_wrong_company_sources_do_not_count_toward_coverage_or_evidence(client, 
     assert "most_sources_wrong_company" in a.coverage_metrics["recovery_reasons"]
 
 
-def test_recovery_does_not_bypass_evidence_gates(client, web):
-    """Sources found in recovery reach the same validation: a false statement on a valid page is not accepted."""
+def test_recovery_sources_reach_the_same_verification_and_its_known_limit(client, web):
+    """Sources found in recovery pass the same identity check and verification. The former Python actor gate (which
+    refused "The government launched ...") was intentionally removed: whether a genuine quotation supports the level is
+    the model's interpretation and the analyst's decision. This test records that limit: the quotation is genuine and
+    verified, the conclusion may still be wrong, and the answer stays pending analyst review."""
     url = f"{SITE}/news"
     web[url] = ("text/html", _page(f"News | {NAME}", ABOUT + "The government launched an energy efficiency programme in 2025."))
     aid = _create(client)
     run_assessment(aid, llm=FakeLLM(), search=Search(first=[], later=[(url, f"{NAME} news")]))
-    _, _, recs, evidence = _state(aid)
-    assert all("government" not in e.evidence_text.lower() or e.evidence_lifecycle != "accepted" for e in evidence)
-    assert recs[("energy_management", "execution")].evidence_ids == []
+    _, sources, recs, evidence = _state(aid)
+    assert all(s.company_match for s in sources if s.status == "PROCESSED")  # the identity check still ran
+    rec = recs[("energy_management", "execution")]
+    quotes = [e for e in evidence if e.id in rec.evidence_ids]
+    assert rec.recommended_level == 2 and quotes and all(e.verification_status == "VERIFIED" for e in quotes)
+    assert "government" in quotes[0].evidence_text.lower()  # genuine quotation, questionable conclusion
+    assert rec.review_status == "PENDING" and any("for the analyst to confirm" in n for n in rec.notes)
 
 
 def test_no_extra_model_calls_are_made_for_recovery_or_resolution(client, web):
@@ -326,7 +369,6 @@ def test_audit_export_has_recall_metrics_and_normal_endpoints_do_not(client, web
     assert "coverage_metrics" not in body and "company_identity" not in body
 
 
-# ---------------------------------------------------------------- entity resolution
 def _results(*urls):
     return [SearchResult("x", u, "x", "q") for u in urls]
 
@@ -418,7 +460,6 @@ def test_identity_stays_the_same_after_recovery_search(client, web):
     assert not [s for s in sources if "polargroup" in (s.url or "") and s.status == "PROCESSED"]
 
 
-# ---------------------------------------------------------------- parent / subsidiary
 def test_parent_report_supports_a_subsidiary_only_inside_its_stated_boundary():
     identity = CompanyIdentity("Polar Cars AB")
     filler = "Polar Holdings AB reports here. " * 10
@@ -436,21 +477,22 @@ def test_subsidiary_report_does_not_support_the_parent():
 
 
 def test_evidence_from_a_parent_report_must_name_the_subsidiary():
-    from app.services.extraction.extractor import Candidate, Passage
-    from app.services.verification.verifier import verify_candidate
+    from app.services.company.source_identity import PARENT_BOUNDARY  # noqa: F401
+    from app.services.rag.retrieval import Passage
+    from app.services.rag.verify import verify_answer
+    from tests.conftest import rag_answer
 
     identity = CompanyIdentity("Polar Cars AB")
 
     def goal(text):
-        passage = Passage(1, 1, 1, "Group report", None, "uploaded_report", 1.0, True, 1, text, 2025, identity_basis="parent_boundary")
-        c = Candidate("energy_management", "planning", "goal", "g", {"goal_found": True, "formalized": True}, text, passage, "llm")
-        return verify_candidate(c, text, company=identity)
+        passage = Passage(1, 1, 1, "Group report", None, "uploaded_report", 1, None, 2025, False, text, requires_company_name=True)
+        raw = rag_answer("EVIDENCE_FOUND", 3, "A goal.", [("chunk_1", text)])
+        return verify_answer(raw, max_level=6, passages=[passage], accepted_source_ids={1}, names_company=identity.is_named_in)
 
-    assert "company_mismatch" in goal("We aim to reduce energy use by 2030.").rejection_codes
-    assert goal("Polar Cars AB will aim to reduce energy use by 2030.").lifecycle == "accepted"
+    assert "company_not_named" in goal("We aim to reduce energy use by 2030.").codes
+    assert goal("Polar Cars AB will aim to reduce energy use by 2030.").ok
 
 
-# ---------------------------------------------------------------- landing page -> primary document
 def _landing(*links):
     anchors = "".join(f'<a href="{u}">{t}</a>' for u, t in links)
     return _page(f"Annual and sustainability reports | {NAME}", ABOUT, anchors)
@@ -507,7 +549,6 @@ def test_wrong_company_report_behind_a_landing_page_stays_blocked(client, web, m
     assert not [e for e in evidence if e.source_id == blocked.id]
 
 
-# ---------------------------------------------------------------- first-party recall + reporting
 def test_first_party_source_inherits_identity_without_repeating_the_name(client, web, monkeypatch):
     """The address carries the exact company name, so "we" in a passage means the company."""
     monkeypatch.setattr(get_settings(), "recovery_search_enabled", False)
@@ -528,9 +569,13 @@ def test_third_party_author_does_not_inherit_identity(client, web, monkeypatch):
     web[url] = ("text/html", _page("Northstar Manufacturing article", text))
     aid = _create(client)
     run_assessment(aid, llm=FakeLLM(), search=Search(first=[(url, f"{NAME} news")]))
-    _, sources, recs, _ = _state(aid)
+    _, sources, recs, evidence = _state(aid)
     assert sources[0].status == "PROCESSED" and sources[0].source_type == "other_web"
-    assert recs[("energy_management", "planning")].evidence_ids == []
+    rec = recs[("energy_management", "planning")]
+    # "we" on a news site is its author: the quotation does not name the company, so no level is recommended
+    assert rec.recommended_level == 0 and rec.evidence_status == "REQUIRES_REVIEW"
+    cited = [e for e in evidence if e.id in rec.evidence_ids]
+    assert all(e.verification_status == "REJECTED" and "company_not_named" in e.rejection_codes for e in cited)
 
 
 def test_processed_environmental_report_counts_as_regular_public_reporting(client, web, monkeypatch):
@@ -542,7 +587,7 @@ def test_processed_environmental_report_counts_as_regular_public_reporting(clien
     run_assessment(aid, llm=FakeLLM(), search=Search(first=[(url, f"{NAME} document")]))
     _, _, recs, _ = _state(aid)
     rec = recs[("reporting", "reporting")]
-    assert rec.recommended_level >= 4 and rec.triggered_rule != "R1_NO_REPORTING_EVIDENCE"
+    assert rec.recommended_level >= 4 and rec.evidence_status == "FOUND" and rec.triggered_rule == "rag:verified"
 
 
 def test_required_term_keeps_a_chunk_even_when_a_small_corpus_scores_it_zero():
@@ -622,7 +667,6 @@ def test_ambiguous_name_can_still_be_assessed_from_an_uploaded_report(client, sa
         assert source.rejection_reason != AMBIGUOUS and not source_gate.source_blocks_evidence(source)
 
 
-# ---------------------------------------------------------------- primary report blocked by a limit
 def _good_pages(web):
     urls = [(f"{SITE}/sustainability/{i}", f"{NAME} sustainability {i}") for i in range(3)]
     for url, _ in urls:
@@ -777,3 +821,4 @@ def test_report_too_large_to_download_with_a_neutral_title_cannot_be_attributed(
     run_assessment(aid, llm=FakeLLM(), search=Search(first=[(url, "Annual and Sustainability Report"), *_good_pages(web)]))
     a, *_ = _state(aid)
     assert a.coverage_metrics["primary_reports_blocked"] == 0
+

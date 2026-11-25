@@ -6,10 +6,13 @@ import json
 
 from openpyxl import load_workbook
 
+from app.core.config import get_settings
 from app.db.session import SessionLocal
 from app.models.entities import Assessment
 from app.services.llm.factory import set_llm_provider
 from app.services.presentation import REDUCED_MODE_NOTICE
+from app.services.rag.prompt import SYSTEM_PROMPT
+from app.services.retrieval.chunker import approx_tokens
 from tests.conftest import FakeLLM
 
 
@@ -73,7 +76,9 @@ def test_upload_validation(client, tmp_path):
         assert client.post(f"/api/assessments/{a['id']}/documents", files={"file": ("fake.pdf", f, "application/pdf")}).status_code == 415
 
 
-def test_full_pipeline_heuristic_mode(client, sample_pdf):
+def test_full_pipeline_without_model_recommends_nothing(client, sample_pdf):
+    """Replaces the former keyword/regex "heuristic mode": without the local model nothing is interpreted, so no level is
+    recommended. The sources are still processed and listed, and the analyst can set levels with a comment."""
     a = _create(client)
     src = _upload(client, a["id"], sample_pdf)
     assert src["original_filename"] == "evil name_.pdf" and src["source_type"] == "uploaded_report"
@@ -85,40 +90,19 @@ def test_full_pipeline_heuristic_mode(client, sample_pdf):
 
     m = _matrix(client, a["id"])
     assert len(m) == 1 + 5 * 3
-    assert m[("reporting", "reporting")]["recommended_level"] == 6
-    assert m[("energy_management", "planning")]["recommended_level"] == 5
-    assert m[("energy_management", "execution")]["recommended_level"] == 3
-    assert m[("energy_management", "performance")]["recommended_level"] == 2
-    assert m[("diversity_inclusion", "planning")]["recommended_level"] == 5
-    assert m[("diversity_inclusion", "execution")]["recommended_level"] == 3  # "in line with our diversity strategy"
-    assert m[("diversity_inclusion", "performance")]["recommended_level"] == 2  # strategy wording is not a sector benchmark
-    assert m[("labor_practices", "execution")]["recommended_level"] == 2  # activity not explicitly tied to a goal
-    assert m[("product_lifecycle", "planning")]["recommended_level"] == 4
-    assert m[("data_security", "planning")]["recommended_level"] == 4
-    # data gaps are "not found", never "does not exist"
-    gap = m[("data_security", "performance")]
-    assert gap["recommended_level"] == 1 and gap["evidence_status"] == "NO_EVIDENCE_FOUND" and gap["evidence_ids"] == []
-    assert gap["reason"].startswith("No evidence of")
-    labor_perf = m[("labor_practices", "performance")]
-    assert labor_perf["recommended_level"] == 1 and any("unquantified" in n for n in labor_perf["notes"])
-    # heuristic mode never yields silently-accepted results
-    for r in m.values():
-        if r["evidence_ids"]:
-            assert r["evidence_status"] != "FOUND"
-            assert r["evidence_ids"]
-
-    # every recommendation above level 1 is backed by verified evidence with page + quote
-    detail = client.get(f"/api/recommendations/{m[('energy_management', 'planning')]['id']}").json()
-    ev = detail["evidence"][0]
-    assert ev["page_number"] == 2 and "30% by 2030" in ev["evidence_text"] and ev["verified"] is True
-    assert detail["conditions"]["quantitative"]["status"] == "met"
-    assert detail["conditions"]["benchmark"]["status"] == "not_found"
-    assert detail["level_definitions"]["5"].startswith("There are formalized goals")
+    assert all(r["recommended_level"] == 0 and r["evidence_ids"] == [] for r in m.values()), "no level without evidence"
+    assert all(r["evidence_status"] in ("REQUIRES_REVIEW", "NO_EVIDENCE_FOUND", "INSUFFICIENT_SOURCE_COVERAGE") for r in m.values())
+    planning = m[("energy_management", "planning")]
+    assert planning["evidence_status"] == "REQUIRES_REVIEW" and planning["reason"].startswith("Insufficient evidence to recommend")
+    # nothing to approve; an analyst may still set a level with a reason
+    rid = planning["id"]
+    assert client.post(f"/api/recommendations/{rid}/review", json={"action": "APPROVE"}).status_code == 422
+    r = client.post(f"/api/recommendations/{rid}/review", json={"action": "OVERRIDE", "selected_level": 5, "comment": "Read the report."})
+    assert r.status_code == 200 and r.json()["final_level"] == 5 and r.json()["recommended_level"] == 0
 
     summary = client.get(f"/api/assessments/{a['id']}").json()
     assert summary["sustainability_report_found"] and summary["sources_reviewed"] == 1
-    assert summary["total"] == 16 and summary["reviewed"] == 0
-    assert summary["data_gaps"] == sum(r["evidence_status"] == "NO_EVIDENCE_FOUND" for r in m.values())
+    assert summary["total"] == 16
 
 
 def test_full_pipeline_with_mocked_llm_and_review_and_export(client, sample_pdf):
@@ -128,7 +112,10 @@ def test_full_pipeline_with_mocked_llm_and_review_and_export(client, sample_pdf)
     _upload(client, a["id"], sample_pdf)
     _run(client, a["id"])
     assert llm.calls, "LLM path should be exercised"
-    assert max(len(c) for c in llm.calls) < 6000  # small contexts only
+    assert len(llm.calls) <= 2 * 16, "one call per question, at most one corrective retry each"
+    # every prompt fits the model's context window together with its answer
+    budget = get_settings().llm_context_tokens - get_settings().llm_max_output_tokens
+    assert max(approx_tokens(SYSTEM_PROMPT) + approx_tokens(c) for c in llm.calls) <= budget
 
     m = _matrix(client, a["id"])
     planning = m[("energy_management", "planning")]
@@ -140,7 +127,9 @@ def test_full_pipeline_with_mocked_llm_and_review_and_export(client, sample_pdf)
     # ... but not exposed in the analyst-facing detail
     d = client.get(f"/api/recommendations/{planning['id']}").json()
     assert "fake:test-1b" not in json.dumps(d) and "triggered_rule" not in d and "confidence" not in d
-    assert d["confidence_label"] in ("High", "Medium", "Low") and d["review_state"] == "review"
+    assert d["confidence_label"] == "Not rated" and d["review_state"] == "review"  # no uncalibrated confidence
+    assert d["conditions"]["evidence_verification"]["status"] == "met"
+    assert d["evidence"] and all(e["verified"] for e in d["evidence"]) and d["evidence"][0]["page_number"] == 2
 
     # ---- analyst review
     rid = planning["id"]
@@ -159,7 +148,7 @@ def test_full_pipeline_with_mocked_llm_and_review_and_export(client, sample_pdf)
     assert detail["decisions"][0]["previous_level"] == 5 and detail["decisions"][0]["comment"] == "Target not board-approved."
 
     events = {e["event_type"] for e in client.get(f"/api/assessments/{a['id']}/audit").json()}
-    assert {"assessment_created", "document_uploaded", "evidence_extracted", "recommendation_generated",
+    assert {"assessment_created", "document_uploaded", "questions_answered", "recommendation_generated",
             "recommendation_overridden", "recommendation_approved"} <= events
 
     # ---- export

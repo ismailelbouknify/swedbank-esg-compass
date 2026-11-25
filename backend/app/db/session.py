@@ -71,6 +71,10 @@ _ADDED_COLUMNS = {
         "evidence_origin": "VARCHAR(40)",
         "llm_quote_failed": "BOOLEAN DEFAULT 0",
     },
+    "document_chunks": {
+        "section_heading": "VARCHAR(300)",
+        "content_kind": "VARCHAR(10)",
+    },
     "sources": {
         "fetch_outcome": "VARCHAR(40)",
         "content_sha256": "VARCHAR(64)",

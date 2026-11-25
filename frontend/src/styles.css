@@ -256,6 +256,7 @@ table.list { width: 100%; border-collapse: collapse; }
 .drawer-body > .notice { margin: 0; }
 .drawer-score { display: flex; flex-direction: column; gap: 8px; }
 .score-line { font-size: 16px; }
+.level-description { margin: 6px 0 0; color: var(--muted, #555); font-size: 14px; }
 .score-big { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .score-struck { font-size: 18px; color: var(--muted); text-decoration: line-through; }
 .label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); font-weight: 700; margin-bottom: 8px; }

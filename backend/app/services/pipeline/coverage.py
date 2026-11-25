@@ -14,7 +14,7 @@ from app.models.entities import Assessment, DocumentPage
 from app.services.company.resolution import AMBIGUOUS
 from app.services.company.source_identity import MISMATCH, REPORT_DOCUMENT_RE, SOURCE_COMPANY_MISMATCH, _domain_labels
 from app.services.documents.report_kind import primary_report_kind
-from app.services.extraction import patterns as P
+from app.services.documents import text_utils as P
 from app.services.pipeline.source_gate import identity_for, source_blocks_evidence
 from app.services.security import policy
 from app.services.security.content_validator import url_path_is_pdf

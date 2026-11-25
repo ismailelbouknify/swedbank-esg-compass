@@ -25,14 +25,6 @@ def _level_text(dim: str, level: int | None) -> str | None:
     return dimension_config(dim)["levels"].get(str(level)) if level else None
 
 
-_COMPANY_CODES = {"company_mismatch", "source_company_mismatch"}
-_ACTOR_CODES = {"external_actor", "numeric_target_subject_mismatch"}
-_FACTOR_CODES = {"factor_mismatch", "cross_factor_mismatch", "exclusion_keyword_match"}
-_DIMENSION_CODES = {"dimension_mismatch", "inactive_goal", "activity_not_performed"}
-_NUMERIC_CODES = {"numeric_not_in_source", "ambiguous_table_alignment", "numeric_target_subject_mismatch", "numeric_target_context_invalid"}
-_NUMERIC_CLAIMS = {"performance_series", "relative_change"}
-
-
 def _lifecycle(e: Evidence) -> str:
     if e.evidence_lifecycle:
         return e.evidence_lifecycle
@@ -40,38 +32,22 @@ def _lifecycle(e: Evidence) -> str:
 
 
 def evidence_validation_fields(e: Evidence, used_ids: set[int]) -> dict[str, Any]:
-    """Why each evidence item did or did not count. A check that does not apply to the item is None."""
+    """Why each quotation did or did not support the AI-recommended level: the lightweight verification result."""
     codes = list(e.rejection_codes or [])
     lifecycle = _lifecycle(e)
-    has_numbers = e.claim_type in _NUMERIC_CLAIMS or e.extracted_value is not None or e.target_year is not None
-    facts = e.facts or {}
     used = e.id in used_ids and lifecycle == "accepted"
-    if used:
-        reason = None
-    elif lifecycle == "accepted":
-        reason = ("outside_assessment_window" if facts.get("in_window") is False
-                  else "unquantified_claim" if e.claim_type == "unquantified_improvement_claim" else "not_selected_for_level")
-    else:
-        reason = ", ".join(codes) or "requires_review"
     source = e.source.company_match if e.source else None
     return {
         "evidence_lifecycle": lifecycle,
-        "evidence_origin": e.evidence_origin or "standard",
-        # only on the items concerned, so that ordinary analyst exports stay free of technical wording
-        **({"llm_quote_failed": True, "llm_quote_failure": facts.get("llm_quote_failure")} if e.llm_quote_failed else {}),
-        "rejection_codes": codes,
-        "company_match": False if _COMPANY_CODES & set(codes) or source == "mismatch" else (True if source else None),
-        "actor_match": not _ACTOR_CODES & set(codes),
-        "factor_match": not _FACTOR_CODES & set(codes),
-        "dimension_match": not _DIMENSION_CODES & set(codes),
-        "numeric_match": (not _NUMERIC_CODES & set(codes)) if has_numbers else None,
+        "rejection_codes": codes,  # verification codes of a withheld answer, e.g. quote_not_found, unknown_chunk
+        "company_match": False if source == "mismatch" or "source_not_accepted" in codes else (True if source else None),
         "used_for_scoring": used,
-        "scoring_exclusion_reason": reason,
+        "scoring_exclusion_reason": None if used else (", ".join(codes) or "requires_review"),
     }
 
 
-EVIDENCE_VALIDATION_COLUMNS = ["evidence_lifecycle", "evidence_origin", "llm_quote_failed", "llm_quote_failure", "rejection_codes", "company_match", "actor_match", "factor_match", "dimension_match",
-                               "numeric_match", "used_for_scoring", "scoring_exclusion_reason"]
+EVIDENCE_VALIDATION_COLUMNS = ["evidence_lifecycle", "rejection_codes", "company_match", "used_for_scoring",
+                               "scoring_exclusion_reason"]
 
 
 def build_export(db: Session, a: Assessment) -> dict[str, Any]:
@@ -127,6 +103,9 @@ def build_export(db: Session, a: Assessment) -> dict[str, Any]:
                 # Legacy compat: reason = AI reason (unchanged semantics for existing callers).
                 "reason": r.reason,
                 "confidence": r.confidence_label, "missing_for_next_level": r.next_level_missing,
+                # verified | not_verified | not_applicable: whether the AI answer's quotations were found in its sources
+                "evidence_verification": {"met": "verified", "not_found": "not_verified"}.get(
+                    ((r.conditions or {}).get("evidence_verification") or {}).get("status"), "not_applicable"),
                 "analyst_comment": latest_comment.get(r.id) if r.review_status != "PENDING" else None,
                 # Surfaced explicitly so exports clearly distinguish AI from analyst.
                 "changed_by_analyst": r.review_status == "OVERRIDDEN",
@@ -173,8 +152,9 @@ def to_json(data: dict[str, Any]) -> bytes:
     return json.dumps(data, indent=2, ensure_ascii=False, default=str).encode("utf-8")
 
 
-RECOMMENDATION_COLUMNS = ["factor", "dimension", "recommended_level", "final_level", "max_level", "review_status",
-                          "reason", "level_description", "confidence", "missing_for_next_level", "analyst_comment"]
+RECOMMENDATION_COLUMNS = ["factor", "dimension", "ai_recommended_level", "final_level", "max_level", "review_status",
+                          "changed_by_analyst", "evidence_verification", "reason", "level_description", "confidence",
+                          "missing_for_next_level", "analyst_comment"]
 
 
 def _cell(v: Any) -> Any:

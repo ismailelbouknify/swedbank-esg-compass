@@ -10,7 +10,7 @@ const DIMS = ["planning", "execution", "performance"] as const;
 function levelText(r: RecommendationDetail | undefined): string {
   if (!r) return "—";
   const changed = r.final_level !== null && r.final_level !== r.recommended_level;
-  if ((r.evidence_status === "NO_EVIDENCE_FOUND" || r.evidence_status === "INSUFFICIENT_SOURCE_COVERAGE") && !changed) return "—";
+  if ((r.recommended_level < 1 || r.evidence_status === "NO_EVIDENCE_FOUND" || r.evidence_status === "INSUFFICIENT_SOURCE_COVERAGE") && !changed) return "—";
   return `${r.final_level ?? r.recommended_level} / ${r.max_level}`;
 }
 

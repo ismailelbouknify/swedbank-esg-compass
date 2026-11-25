@@ -7,7 +7,7 @@ import pytest
 from app.services.documents.pdf_extractor import extract_pdf
 from app.services.documents.url_safety import UnsafeURLError, validate_public_url
 from app.services.retrieval.bm25 import BM25Index, query_for
-from app.services.retrieval.chunker import chunk_pages
+from app.services.retrieval.chunker import approx_tokens, chunk_pages
 
 
 def test_pdf_extraction_preserves_pages(sample_pdf):
@@ -42,8 +42,9 @@ def test_non_pdf_rejected(tmp_path):
 def test_chunking_respects_pages_size_and_overlap():
     sentences = [f"Sentence number {i} talks about energy efficiency measures." for i in range(60)]
     page1 = " ".join(sentences)
-    chunks = chunk_pages([(1, page1), (2, "Short second page about diversity.")], size_words=60, overlap_words=15)
-    assert all(len(c.text.split()) <= 60 for c in chunks)
+    # sizes are in approximate model tokens (they were words before the RAG chunker)
+    chunks = chunk_pages([(1, page1), (2, "Short second page about diversity.")], size_tokens=80, overlap_tokens=20)
+    assert all(approx_tokens(c.text) <= 80 for c in chunks)
     assert {c.page_number for c in chunks} == {1, 2}
     p1 = [c for c in chunks if c.page_number == 1]
     assert len(p1) > 3
@@ -55,8 +56,9 @@ def test_chunking_respects_pages_size_and_overlap():
 
 def test_chunking_splits_long_tables():
     table = "\n".join(" ".join(str(n) for n in range(i, i + 20)) for i in range(0, 400, 20))
-    chunks = chunk_pages([(3, table)], size_words=50, overlap_words=10)
-    assert all(len(c.text.split()) <= 50 for c in chunks)
+    chunks = chunk_pages([(3, table)], size_tokens=70, overlap_tokens=10)
+    assert len(chunks) > 3 and all(approx_tokens(c.text) <= 70 for c in chunks)
+    assert all(c.is_table for c in chunks)
 
 
 def test_bm25_retrieves_factor_relevant_chunks():

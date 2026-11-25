@@ -103,9 +103,11 @@ export default function ReviewDrawer({ recId, onClose, onChanged, onNext }: {
   }
 
   const insufficient = rec?.evidence_status === "INSUFFICIENT_SOURCE_COVERAGE";
-  const noEvidence = rec?.evidence_status === "NO_EVIDENCE_FOUND" || insufficient;
-  const [primary, ...others] = rec?.evidence ?? [];
+  const withheld = !!rec && rec.recommended_level < 1 && !insufficient && rec.evidence_status !== "NO_EVIDENCE_FOUND";
+  const noEvidence = rec?.evidence_status === "NO_EVIDENCE_FOUND" || insufficient || withheld;
+  const evidence = rec?.evidence ?? [];
   const changed = rec && rec.final_level !== null && rec.final_level !== rec.recommended_level;
+  const verification = rec?.conditions?.evidence_verification;
   const title = rec ? (rec.factor === "reporting" ? "Reporting" : rec.factor_label) : "Loading…";
 
   return (
@@ -126,14 +128,20 @@ export default function ReviewDrawer({ recId, onClose, onChanged, onNext }: {
           <div className="drawer-body">
             <div className="drawer-score">
               {noEvidence && !changed ? (
-                <div className="score-line"><span className="score-big">—</span> <span className="muted">{insufficient ? "Insufficient source coverage" : "No evidence found in reviewed sources"}</span></div>
+                <div className="score-line">
+                  <span className="score-big">—</span>{" "}
+                  <span className="muted">{insufficient ? "Insufficient source coverage" : "Insufficient evidence to recommend an assessment level."}</span>
+                </div>
               ) : (
                 <div className="score-line">
-                  <span className="muted">{changed ? "Recommended" : "Recommended:"}</span>{" "}
-                  <span className={changed ? "score-struck" : "score-big"}>{rec.recommended_level} / {rec.max_level}</span>
-                  {changed && <> <span className="muted">→ Analyst:</span> <span className="score-big">{rec.final_level} / {rec.max_level}</span></>}
+                  {rec.recommended_level >= 1 && <>
+                    <span className="muted">AI-recommended:</span>{" "}
+                    <span className={changed ? "score-struck" : "score-big"}>{rec.recommended_level} / {rec.max_level}</span>
+                  </>}
+                  {changed && <> <span className="muted">{rec.recommended_level >= 1 ? "→ " : ""}Analyst-approved:</span> <span className="score-big">{rec.final_level} / {rec.max_level}</span></>}
                 </div>
               )}
+              {rec.level_description && !(noEvidence && !changed) && <p className="level-description">{rec.level_description}</p>}
               <ReviewStateBadge state={rec.review_state} />
             </div>
 
@@ -145,10 +153,19 @@ export default function ReviewDrawer({ recId, onClose, onChanged, onNext }: {
               )}
             </section>
 
-            {primary && (
+            {evidence.length > 0 && (
               <section>
-                <h3 className="label">Evidence</h3>
-                <EvidenceItem e={primary} />
+                <h3 className="label">{withheld ? "Suggested evidence (not verified)" : "Evidence"}</h3>
+                {evidence.map((e) => <EvidenceItem key={e.id} e={e} />)}
+              </section>
+            )}
+
+            {verification && (
+              <section>
+                <h3 className="label">Evidence verification</h3>
+                <p>{verification.status === "met" ? "Verified: every quotation was found in the cited source."
+                  : verification.status === "not_found" ? "Not verified: no level is recommended. Please review the sources."
+                  : "No quotation to verify."}</p>
               </section>
             )}
 
@@ -208,11 +225,11 @@ export default function ReviewDrawer({ recId, onClose, onChanged, onNext }: {
 
             {details && (
               <div className="details">
-                {Object.keys(rec.conditions).length > 0 && (
+                {Object.keys(rec.conditions).filter((k) => k !== "evidence_verification").length > 0 && (
                   <section>
                     <h3 className="label">Detected</h3>
                     <ul className="checklist">
-                      {Object.entries(rec.conditions).map(([k, c]) => (
+                      {Object.entries(rec.conditions).filter(([k]) => k !== "evidence_verification").map(([k, c]) => (
                         <li key={k}>
                           <span className={`mark ${c.status}`} aria-hidden="true">{MARK[c.status]}</span>
                           <span className="sr-only">{MARK_LABEL[c.status]}: </span>
@@ -232,18 +249,6 @@ export default function ReviewDrawer({ recId, onClose, onChanged, onNext }: {
                   <section>
                     <h3 className="label">Notes</h3>
                     <ul className="plain-list bullets">{rec.notes.map((n, i) => <li key={i}>{n}</li>)}</ul>
-                  </section>
-                )}
-                {others.length > 0 && (
-                  <section>
-                    <h3 className="label">Other supporting evidence</h3>
-                    {others.map((e) => <EvidenceItem key={e.id} e={e} />)}
-                  </section>
-                )}
-                {!noEvidence && (
-                  <section>
-                    <h3 className="label">Confidence</h3>
-                    <p>{rec.confidence_label}</p>
                   </section>
                 )}
                 <section>

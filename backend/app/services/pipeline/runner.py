@@ -1,13 +1,16 @@
-"""Assessment pipeline:
+"""Assessment pipeline (simple evidence-grounded RAG):
 
-documents/web -> retrieval (BM25) -> local LLM extracts structured facts -> verification
--> deterministic Python rules -> recommendations -> analyst review.
+company -> source discovery -> text extraction -> chunking -> retrieval (BM25) -> one local-model call per
+questionnaire question, which reads the questionnaire criteria and recommends a level with exact quotations ->
+lightweight verification (JSON, scale, chunk ids, quotes, company sources; one corrective retry) -> analyst review.
+
+No supporting evidence means no generated answer: an abstention is recorded as "no evidence found" or "insufficient
+source coverage" (never as a low level), and an answer that fails verification is withheld for the analyst.
 
 Runs in a background thread (FastAPI BackgroundTasks); progress is persisted on the
 Assessment row so the UI can poll /status."""
 from __future__ import annotations
 
-import hashlib
 import logging
 import time
 import traceback
@@ -18,39 +21,33 @@ from typing import Callable
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.config.loader import FACTOR_DIMENSIONS, OFFICIAL_SOURCE_TYPES, REPORTING_FACTOR, factor_label, load_rules, source_priority
+from app.config.loader import REPORTING_FACTOR, load_rules
 from app.core.config import get_settings
-from app.models.entities import (
-    AnalystDecision, Assessment, Document, DocumentChunk, DocumentPage, Evidence, Recommendation, Source,
-)
+from app.models.entities import AnalystDecision, Assessment, Evidence, Recommendation
 from app.services.assessments.registry import supersede_previous
 from app.services.audit import log_event, log_source_rejection
 from app.services.company.identify import normalize_company_name
 from app.services.company.resolution import AMBIGUOUS
 from app.services.company.source_identity import SOURCE_COMPANY_MISMATCH
 from app.services.documents.url_safety import registrable_domain
-from app.services.extraction import patterns as P
-from app.services.extraction.extractor import Candidate, FactExtractor, Passage, passage_signal
 from app.services.llm.base import LLM_NOT_CONFIGURED_MESSAGE, LLMProvider, LLMStatus, NullLLMProvider
 from app.services.llm.factory import get_llm_provider
 from app.services.pipeline.coverage import (
-    AMBIGUOUS_COMPANY_MESSAGE, BLOCKED_REPORT_MESSAGE, BLOCKED_REPORT_REASON, INSUFFICIENT_COVERAGE_MESSAGE, INSUFFICIENT_SOURCE_COVERAGE, NOT_ASSESSED_LEVEL, CoverageCheck, assess_coverage, coverage_state,
+    AMBIGUOUS_COMPANY_MESSAGE, BLOCKED_REPORT_MESSAGE, BLOCKED_REPORT_REASON, EVIDENCE_FOUND, INSUFFICIENT_COVERAGE_MESSAGE,
+    INSUFFICIENT_SOURCE_COVERAGE, NOT_ASSESSED_LEVEL, CoverageCheck, assess_coverage, coverage_state,
 )
 from app.services.pipeline.discovery import WebAccessState, discover, recover_sources
 from app.services.pipeline.network_notices import network_audit_details, network_notices
 from app.services.pipeline.ingest import ingest_pdf
-from app.services.pipeline.source_gate import apply_source_identity, identity_for, source_blocks_evidence
-from app.services.retrieval.bm25 import BM25Index, query_for
-from app.services.scoring.common import NO_EVIDENCE_FOUND, REQUIRES_REVIEW, EvidenceItem, ScoreResult, assert_scoring_evidence
-from app.services.scoring.confidence import compute_confidence, label_for
-from app.services.scoring.execution import score_execution
-from app.services.scoring.performance import score_performance
-from app.services.scoring.planning import score_planning
-from app.services.scoring.reporting import score_reporting
+from app.services.pipeline.source_gate import apply_source_identity, identity_for
+from app.services.rag import answer as A
+from app.services.rag.answer import Answer, Answerer
+from app.services.rag.prompt import prompt_overhead_tokens
+from app.services.rag.questions import Question, questionnaire
+from app.services.rag.retrieval import Passage, Retriever, accepted_sources, load_passages
 from app.services.search.base import SearchProvider
 from app.services.search.providers import get_search_provider
 from app.services.security.policy import SourceRejection, run_bounded
-from app.services.verification.verifier import VERIFIED, verify_candidate
 
 log = logging.getLogger(__name__)
 
@@ -59,8 +56,8 @@ STAGES = [
     "Searching reports",
     "Processing documents",
     "Retrieving ESG evidence",
-    "Extracting facts",
-    "Applying ESG rules",
+    "Answering questionnaire questions",
+    "Verifying evidence",
     "Preparing assessment",
 ]
 STAGE_PROGRESS = [5, 15, 30, 40, 45, 90, 97]
@@ -73,6 +70,17 @@ BUDGET_GAP_REASON = ("Insufficient source coverage \u2014 not every relevant pas
                      "processing limit, so no conclusion was drawn.")
 COVERAGE_LIMITED_MESSAGE = ("Some public sources could not be processed, so a gap in this assessment may reflect an "
                             "unavailable source rather than missing company activity.")
+INSUFFICIENT_EVIDENCE_TEXT = "Insufficient evidence to recommend an assessment level."
+NO_PASSAGE_TEXT = "No passage relevant to this question was found in the reviewed sources."
+UNVERIFIED_TEXT = ("The suggested answer could not be verified against the sources (its quotations or references did not "
+                   "check out), so no level is recommended. Please review this question.")
+MODEL_ERROR_TEXT = "The local analysis component could not answer this question, so no level is recommended."
+BUDGET_TEXT = ("This question was not analysed within the assessment's processing limit, so no level is recommended.")
+NO_LLM_TEXT = ("The local analysis component is not available on this computer, so no level can be recommended. "
+               "Install the local model, or set the level after reading the sources.")
+AI_NOTE = ("AI-recommended level, based on the quoted passages. The quotations were checked against the sources; whether "
+           "they meet the level's criteria is for the analyst to confirm.")
+WITHHELD_NOTE = "A suggested answer was withheld because its evidence could not be verified."
 
 
 
@@ -104,6 +112,9 @@ class AssessmentRunner:
         self.llm_calls = 0
         self.llm_seconds = 0.0
         self.duplicate_passages = 0
+        self.questions: list[Question] = questionnaire()
+        self.llm_available = False
+        self.outcomes: dict[str, int] = {}
 
     @contextmanager
     def _timed(self, stage: str):
@@ -146,16 +157,14 @@ class AssessmentRunner:
             if recovered:
                 with self._timed("retrieval"):
                     retrieved = self._retrieve()
-            passages_by_q, all_passages, report_passages = retrieved
+            plans = retrieved[0]
             with self._timed("coverage"):
-                self.coverage = self._coverage(passages_by_q)
+                self.coverage = self._coverage(plans)
                 self._report_final_coverage()
-            with self._timed("extraction"):
-                candidates = self._extract(passages_by_q, all_passages, report_passages)
-            with self._timed("grounding_validation"):
-                evidence = self._persist_evidence(candidates)
-            with self._timed("scoring"):
-                self._score(evidence)
+            with self._timed("answering"):
+                answers = self._answer(plans)
+            with self._timed("persisting"):
+                evidence = self._persist(answers)
             self._record_coverage_metrics(evidence)
             self._stage(6)
             a.status = "COMPLETED"
@@ -219,10 +228,11 @@ class AssessmentRunner:
         self.a.llm_model = st.model if st.available else None
         if not st.available:
             msg = st.message or LLM_NOT_CONFIGURED_MESSAGE
-            if self.settings.allow_heuristic_fallback:
-                self.warnings.append(msg + " Using deterministic keyword/regex extraction instead (lower confidence; all levels require analyst review).")
-            else:
+            if not self.settings.allow_heuristic_fallback:
                 raise RuntimeError(msg)
+            # without the model nothing can be answered: sources are still gathered, every level is left to the analyst
+            self.warnings.append(msg + " No levels can be recommended without it; the sources are listed for manual review.")
+        self.llm_available = st.available
         log_event(self.db, "company_identified", assessment_id=self.a.id, entity_type="company", entity_id=c.id,
                   details={"name": c.name, "normalized": c.normalized_name, "domain": c.domain})
         self.db.commit()
@@ -308,10 +318,10 @@ class AssessmentRunner:
         c["pdf_parse_seconds"] = c.get("pdf_parse_seconds", 0.0) + rep.pdf_parse_seconds
         c["duplicate_documents"] = c.get("duplicate_documents", 0) + rep.duplicate_documents
 
-    def _coverage(self, by_q) -> CoverageCheck:
-        """Uses only the cheap re-ranking signal on retrieved passages: no model call is needed to see a thin result."""
+    def _coverage(self, plans) -> CoverageCheck:
+        """Source availability plus a retrieval diagnostic (passages retrieved per factor). No model call."""
         factors = [f["key"] for f in self.rules["factors"]]
-        candidates = {f: sum(passage_signal(f, dim, p.text) > 0 for dim in FACTOR_DIMENSIONS for p in by_q.get((f, dim), [])) for f in factors}
+        candidates = {f: sum(len(plans[q.key][0]) for q in self.questions if q.factor == f) for f in factors}
         without = sum(not n for n in candidates.values())
         return assess_coverage(self.db, self.a, self.settings, without, len(factors), factor_candidates=candidates)
 
@@ -377,7 +387,10 @@ class AssessmentRunner:
             "model_calls": self.llm_calls,
             "model_seconds": round(self.llm_seconds, 2),
             "passages_deduplicated": self.duplicate_passages,
-            **getattr(self, "extraction_counts", {}),
+            "model_call_ceiling": self.settings.max_llm_calls_per_assessment,
+            "questions": len(self.questions),
+            "answer_outcomes": dict(self.outcomes),
+            "questions_answered": self.outcomes.get(A.VERIFIED, 0),
             "fetch_seconds": round(c.get("fetch_seconds", 0.0), 2),
             "pdf_parse_seconds": round(c.get("pdf_parse_seconds", 0.0), 2),
             "duplicate_documents_skipped": c.get("duplicate_documents", 0),
@@ -403,275 +416,134 @@ class AssessmentRunner:
         }
         self.db.commit()
 
-    def _passages(self) -> list[Passage]:
-        rows = self.db.execute(
-            select(DocumentChunk, Document, Source)
-            .join(Document, DocumentChunk.document_id == Document.id)
-            .join(Source, Document.source_id == Source.id)
-            .where(Source.assessment_id == self.a.id, Source.status == "PROCESSED")
-        ).all()
-        out = []
-        seen_text: set[str] = set()
-        # the best source first, so that a passage repeated on several pages is kept from the best one
-        rows = sorted(rows, key=lambda r: (source_priority(r[2].source_type)["priority"], r[2].id, r[0].chunk_index))
-        self.duplicate_passages = 0
-        for ch, doc, src in rows:
-            if src.company_match is None or source_blocks_evidence(src):
-                continue  # no recorded identity decision means no evidence, whatever the reason
-            digest = hashlib.sha1(P.normalize_ws(ch.text).lower().encode()).hexdigest()
-            if digest in seen_text:
-                self.duplicate_passages += 1  # mirrored pages (language/region copies): read once, extracted once
-                continue
-            seen_text.add(digest)
-            out.append(Passage(
-                chunk_id=ch.id, document_id=doc.id, source_id=src.id, source_title=doc.title or src.title,
-                source_url=src.url, source_type=src.source_type, source_quality=source_priority(src.source_type)["quality"],
-                is_public=src.is_public, page_number=ch.page_number if doc.doc_kind == "pdf" else None,
-                text=ch.text, doc_year=doc.report_year, identity_basis=src.company_match,
-            ))
-        return out
+    # ------------------------------------------------------------------ retrieval -> answers -> records
+    def _passage_budget(self, q: Question) -> int:
+        """Tokens left for passages in the model's context window after the instructions, question and answer."""
+        s = self.settings
+        free = s.llm_context_tokens - s.llm_max_output_tokens - prompt_overhead_tokens(q, self.a.company.name, self.a.year) - 64
+        return max(300, free)
 
     def _retrieve(self):
         self._stage(3)
-        passages = self._passages()
-        index = BM25Index([{"id": i, "text": p.text, "page_number": p.page_number} for i, p in enumerate(passages)])
-        llm_ok = self.llm.status().available
-        k = self.settings.max_chunks_per_question if llm_ok else self.settings.heuristic_chunks_per_question
-        by_q: dict[tuple[str, str], list[Passage]] = {}
-        for f in self.rules["factors"]:
-            for dim in FACTOR_DIMENSIONS:
-                terms, must = query_for(f["key"], dim)
-                hits = index.search(terms, top_k=self.settings.retrieval_candidates, must_contain_any=must)
-                # re-rank: passages with a dimension signal first, then source priority, then BM25
-                ranked = sorted(
-                    hits,
-                    key=lambda h: (passage_signal(f["key"], dim, h.text) > 0, passages[h.chunk_id].source_quality, h.score),
-                    reverse=True,
-                )
-                by_q[(f["key"], dim)] = [passages[h.chunk_id] for h in ranked[:k]]
-        # one representative passage per processed official source (document-level reporting evidence): the first
-        # one that actually discloses something about sustainability, else the document's first passage
-        report_passages: dict[int, Passage] = {}
-        for p in passages:
-            if p.source_type not in OFFICIAL_SOURCE_TYPES:
-                continue
-            current = report_passages.get(p.source_id)
-            if current is None or (P.reporting_statement(p.text) and not P.reporting_statement(current.text)):
-                report_passages[p.source_id] = p
+        passages, self.duplicate_passages = load_passages(self.db, self.a)
+        retriever = Retriever(passages)
+        plans: dict[tuple[str, str], tuple[list[Passage], int]] = {
+            q.key: retriever.retrieve(q, self.settings.rag_chunks_per_question, self._passage_budget(q)) for q in self.questions
+        }
         log_event(self.db, "retrieval_completed", assessment_id=self.a.id,
-                  details={"chunks_indexed": len(passages), "questions": len(by_q)})
+                  details={"chunks_indexed": len(passages), "questions": len(plans),
+                           "chunks_per_question": {f"{k[0]}:{k[1]}": len(v[0]) for k, v in plans.items()}})
         self.db.commit()
-        return by_q, passages, list(report_passages.values())
+        return (plans,)
 
-    def _extract(self, by_q, all_passages, report_passages) -> list[Candidate]:
+    def _answer(self, plans) -> list[Answer]:
         self._stage(4)
-        total_q = len(by_q) + 1
-        done = 0
-
-        def progress() -> None:
-            self.a.progress = STAGE_PROGRESS[4] + (STAGE_PROGRESS[5] - STAGE_PROGRESS[4]) * done / total_q
+        s = self.settings
+        answerer = Answerer(self.llm, self.a.company.name, self.a.year, max_output_tokens=s.llm_max_output_tokens,
+                            call_budget=s.max_llm_calls_per_assessment or None, names_company=identity_for(self.a).is_named_in)
+        accepted = set(accepted_sources(self.a))
+        answers: list[Answer] = []
+        for n, q in enumerate(self.questions):
+            passages, candidates = plans[q.key]
+            self.a.stage_message = f"Answering: {q.factor_label}" + ("" if q.factor == REPORTING_FACTOR else f" \u2014 {q.dimension_label}")
+            self.a.progress = STAGE_PROGRESS[4] + (STAGE_PROGRESS[5] - STAGE_PROGRESS[4]) * n / len(self.questions)
             self.db.commit()
-
-        budget = self.settings.max_llm_calls_per_assessment or None
-        ex = FactExtractor(self.llm, self.a.year, self.settings.allow_heuristic_fallback, llm_budget=budget)
-        llm_started = time.perf_counter()
-        self.a.extraction_mode = ex.mode
-        candidates: list[Candidate] = []
-        # reporting: regex across all official chunks; LLM only on assurance passages
-        ex.current_question = (REPORTING_FACTOR, "reporting")
-        candidates += ex.reporting(all_passages, report_passages)
-        done += 1
-        progress()
-        # round-robin by rank: the best passage of every question before the second-best of any, so that a call
-        # budget can never be spent on one factor while another factor's strongest passage is left unread
-        fns = {"planning": ex.planning, "execution": ex.execution, "performance": ex.performance}
-        depth = max((len(v) for v in by_q.values()), default=0)
-        for rank in range(depth):
-            for (fkey, dim), passages in by_q.items():
-                if rank >= len(passages):
-                    continue
-                self.a.stage_message = f"Extracting facts: {factor_label(fkey)} \u2014 {dim}"
-                ex.current_question = (fkey, dim)
-                candidates += fns[dim](fkey, [passages[rank]])
-                if rank == len(passages) - 1:
-                    done += 1
-                    progress()
-        self.warnings.extend(ex.warnings)
-        self.llm_calls, self.llm_seconds = ex.llm_calls, ex.llm_seconds
-        self.budget_cut = set(ex.budget_cut)
-        self.extraction_counts = {"model_budget": budget, "budget_exhausted_passages": ex.budget_exhausted,
-                                  "questions_not_fully_analysed": sorted(f"{f}:{d}" for f, d in ex.budget_cut),
-                                  "model_calls_avoided": dict(ex.skipped_llm)}
-        log.info("extraction_timing: llm_calls=%d llm_seconds=%.1f other_seconds=%.1f", ex.llm_calls, ex.llm_seconds,
-                 time.perf_counter() - llm_started - ex.llm_seconds)
-        if ex.llm_failures:
-            self.warnings.append(f"{ex.llm_failures} LLM response(s) could not be parsed; those passages used heuristic extraction.")
-        self.a.extraction_mode = ex.mode if ex.llm_calls == 0 else "llm"
-        log_event(self.db, "fact_extraction_completed", assessment_id=self.a.id,
-                  details={"candidates": len(candidates), "llm_calls": ex.llm_calls, "llm_failures": ex.llm_failures, "mode": ex.mode})
-        self.db.commit()
-        return candidates
-
-    def _persist_evidence(self, candidates: list[Candidate]) -> list[Evidence]:
-        page_cache: dict[tuple[int, int], str | None] = {}
-
-        def page_text(p: Passage) -> str | None:
-            key = (p.document_id, p.page_number or 1)
-            if key not in page_cache:
-                row = self.db.execute(select(DocumentPage.text).where(
-                    DocumentPage.document_id == p.document_id, DocumentPage.page_number == (p.page_number or 1))).first()
-                page_cache[key] = row[0] if row else None
-            return page_cache[key]
-
-        out: list[Evidence] = []
-        seen: set[tuple] = set()
-        identity = identity_for(self.a)
-        sources_by_id = {s.id: s for s in self.a.sources}
-        for c in candidates:
-            key = (c.factor, c.dimension, c.claim_type, c.passage.source_id, c.evidence_text[:120])
-            if key in seen:
+            if passages and not self.llm_available:
+                answers.append(Answer(q, A.MODEL_ERROR, passages, errors=["model not available"], candidates=candidates))
                 continue
-            seen.add(key)
-            source = sources_by_id.get(c.passage.source_id)
-            blocked = source_blocks_evidence(source)
-            vr = verify_candidate(c, page_text(c.passage), source_ok=not blocked, company=identity)
-            if blocked:
-                vr.rejection_codes = ["source_company_mismatch"]
+            answers.append(answerer.answer(q, passages, accepted, candidates))
+        self.llm_calls, self.llm_seconds = answerer.calls, answerer.seconds
+        self.a.extraction_mode = "llm" if self.llm_available else "none"
+        for ans in answers:
+            self.outcomes[ans.outcome] = self.outcomes.get(ans.outcome, 0) + 1
+        log.info("rag_answering: questions=%d llm_calls=%d llm_seconds=%.1f outcomes=%s",
+                 len(answers), answerer.calls, answerer.seconds, self.outcomes)
+        log_event(self.db, "questions_answered", assessment_id=self.a.id,
+                  details={"llm_calls": answerer.calls, "llm_seconds": round(answerer.seconds, 1), "outcomes": self.outcomes})
+        self.db.commit()
+        return answers
+
+    def _evidence_rows(self, ans: Answer, verified: bool) -> list[Evidence]:
+        """Quotations as evidence records. Source, page and title come from the chunk records, never from the model."""
+        rows = []
+        level = ans.level if verified else ans.proposed_level
+        for quote in ans.quotes:
+            p = quote.passage
+            if p is None:
+                continue  # an unknown chunk id has no source to record; the error is in the recommendation's audit data
+            ok = verified and quote.verified
             ev = Evidence(
-                assessment_id=self.a.id, company_id=self.a.company_id, factor=c.factor, dimension=c.dimension,
-                claim_type=c.claim_type, claim_text=c.claim_text[:2000], facts=c.facts,
-                extracted_value=c.extracted_value, extracted_unit=(str(c.extracted_unit)[:50] if c.extracted_unit else None),
-                target_year=c.target_year, baseline_year=c.baseline_year,
-                source_id=c.passage.source_id, chunk_id=c.passage.chunk_id, source_title=c.passage.source_title,
-                source_url=c.passage.source_url, page_number=c.passage.page_number, evidence_text=vr.quote[:4000],
-                extraction_method=c.method, model_name=c.model_name, llm_confidence=c.llm_confidence,
-                verification_status=vr.status, verification_notes=vr.notes,
-                evidence_lifecycle=vr.lifecycle, rejection_codes=vr.rejection_codes,
-                evidence_origin=c.evidence_origin, llm_quote_failed=c.llm_quote_failed,
+                assessment_id=self.a.id, company_id=self.a.company_id, factor=ans.question.factor, dimension=ans.question.dimension,
+                claim_type="rag_quote", claim_text=(ans.explanation or "")[:2000],
+                facts={"chunk_ref": p.label, "level": level, "section": p.section, "report_year": p.report_year, "table": p.is_table},
+                source_id=p.source_id, chunk_id=p.chunk_id, source_title=p.source_title, source_url=p.source_url,
+                page_number=p.page_number, evidence_text=quote.text[:4000], extraction_method="llm", model_name=self.llm.model_name,
+                verification_status="VERIFIED" if ok else "REJECTED",
+                verification_notes=[f"quotation found in {p.label}"] if quote.verified else [f"quotation not found in {p.label}"],
+                evidence_lifecycle="accepted" if ok else "rejected", rejection_codes=[] if ok else list(ans.codes),
             )
             self.db.add(ev)
             self.db.flush()
-            log_event(self.db, "evidence_extracted", assessment_id=self.a.id, entity_type="evidence", entity_id=ev.id,
-                      details={"factor": c.factor, "dimension": c.dimension, "claim_type": c.claim_type,
-                               "method": c.method, "model": c.model_name, "verification": vr.status})
-            out.append(ev)
-        self.db.commit()
-        return out
+            rows.append(ev)
+        return rows
 
-    def _score(self, evidence: list[Evidence]) -> None:
+    def _persist(self, answers: list[Answer]) -> list[Evidence]:
         self._stage(5)
-        heuristic_cert = self.rules["confidence"]["heuristic_extraction_certainty"]
-
-        def _is_accepted(e: Evidence) -> bool:
-            # Use lifecycle if set (new rows), fall back to verification_status for legacy rows.
-            if e.evidence_lifecycle is not None:
-                return e.evidence_lifecycle == "accepted"
-            return e.verification_status == VERIFIED
-
-        def item(e: Evidence) -> EvidenceItem:
-            if e.extraction_method == "llm":
-                cert = min(0.9, e.llm_confidence if e.llm_confidence is not None else 0.6)
-            elif e.extraction_method == "regex":
-                cert = 0.8  # deterministic pattern match on verbatim text
+        check = self.coverage or assess_coverage(self.db, self.a, self.settings, 0, 0)
+        all_rows: list[Evidence] = []
+        for ans in answers:
+            q = ans.question
+            verified = ans.outcome == A.VERIFIED
+            rows = self._evidence_rows(ans, verified) if ans.outcome in (A.VERIFIED, A.UNVERIFIED) else []
+            all_rows += rows
+            notes: list[str] = []
+            next_missing: list[str] = []
+            if verified:
+                level, status, coverage, reason = ans.level, "FOUND", EVIDENCE_FOUND, ans.explanation
+                notes.append(AI_NOTE)
+                check_state = ("met", "Every quotation was found in the cited source passage.")
+            elif ans.outcome in (A.ABSTAINED, A.NO_PASSAGES):
+                coverage = coverage_state([], check, q.factor)
+                level, status = NOT_ASSESSED_LEVEL, coverage
+                if coverage == INSUFFICIENT_SOURCE_COVERAGE:
+                    reason = (BLOCKED_REPORT_REASON if check.blocked_primary_reports else
+                              "Insufficient source coverage \u2014 the system could not access enough reliable company information.")
+                    next_missing = ["Upload the company's sustainability or annual report to continue the assessment."]
+                else:
+                    reason = INSUFFICIENT_EVIDENCE_TEXT + " " + (NO_PASSAGE_TEXT if ans.outcome == A.NO_PASSAGES or not ans.explanation
+                                                                 else ans.explanation)
+                check_state = ("unknown", "No level was recommended, so there was nothing to verify.")
             else:
-                cert = heuristic_cert
-            return EvidenceItem(e.id, e.claim_type, dict(e.facts or {}), True, e.source_id,
-                                source_priority(e.source.source_type)["quality"], cert, e.extraction_method, e.page_number)
-
-        # Only accepted evidence reaches the rule engine. Soft candidates only route the answer to review.
-        accepted = [e for e in evidence if _is_accepted(e) and not source_blocks_evidence(e.source)]
-        accepted_ids = {e.id for e in accepted}
-        fallback_ids = {e.id for e in accepted if e.evidence_origin}
-        items = {e.id: item(e) for e in accepted}
-        review_ids: dict[tuple[str, str], list[int]] = {}
-        for e in evidence:
-            if e.id not in accepted_ids and e.evidence_lifecycle != "rejected" and e.verification_status != "REJECTED":
-                review_ids.setdefault((e.factor, e.dimension), []).append(e.id)
-        processed = [s for s in self.a.sources if s.status == "PROCESSED"]
-        coverage = {"sources_reviewed": len(processed),
-                    "has_report": any(s.source_type in ("uploaded_report", "sustainability_report", "annual_report") for s in processed)}
-
-        def ev_for(factor: str, dim: str) -> list[EvidenceItem]:
-            return [items[e.id] for e in accepted if e.factor == factor and e.dimension == dim]
-
-        source_coverage = self.coverage or assess_coverage(self.db, self.a, self.settings, 0, 0)
-        results: list[tuple[str, str, ScoreResult, list[EvidenceItem]]] = []
-        rep_items = ev_for(REPORTING_FACTOR, "reporting")
-        results.append((REPORTING_FACTOR, "reporting", score_reporting(rep_items), rep_items))
-        for f in self.rules["factors"]:
-            label = f["label"]
-            p_items = ev_for(f["key"], "planning")
-            planning = score_planning(p_items, label, factor_key=f["key"])
-            e_items = ev_for(f["key"], "execution")
-            execution = score_execution(e_items, label, formal_goal_exists=planning.recommended_level >= 3)
-            perf_items = ev_for(f["key"], "performance")
-            perf = score_performance(perf_items, label, self.a.year)
-            results += [(f["key"], "planning", planning, p_items), (f["key"], "execution", execution, e_items),
-                        (f["key"], "performance", perf, perf_items)]
-
-        heuristic_mode = self.a.extraction_mode == "heuristic"
-        for factor, dim, r, its in results:
-            conf, label, breakdown = compute_confidence(r, its, coverage)
-            notes = list(r.notes)
-            status = r.evidence_status
-            if heuristic_mode and r.evidence_ids:
-                # without the LLM nobody interpreted the context: never High, always analyst review
-                conf = min(conf, 0.7)
-                label = label_for(conf)
-                breakdown["capped"] = "heuristic extraction (local LLM unavailable)"
-                if status == "FOUND":
-                    status = "REQUIRES_REVIEW"
-                notes.append("Local LLM was not available; facts came from keyword/regex fallback extraction.")
-            if fallback_ids & set(r.evidence_ids):
-                # a sentence no model confirmed as the goal: it may count, but an analyst must confirm it
-                conf = min(conf, 0.7)
-                label = label_for(conf)
-                breakdown["capped"] = "goal sentence taken directly from the source text"
-                if status == "FOUND":
-                    status = REQUIRES_REVIEW
-                notes.append("This answer rests on a goal sentence taken directly from the source text; please confirm it.")
-            to_review = review_ids.get((factor, dim), [])
-            if to_review:
-                notes.append(f"{len(to_review)} evidence item(s) could not be confirmed against the source and were not used for the level.")
-                if status == NO_EVIDENCE_FOUND:
-                    status = REQUIRES_REVIEW
-            # persist evaluation details computed during scoring (e.g. performance change %)
-            for it in its:
-                if "evaluation" in it.facts:
-                    ev = next(e for e in accepted if e.id == it.id)
-                    ev.facts = {**(ev.facts or {}), "evaluation": it.facts["evaluation"]}
-            # activities outside the time window explain the answer in its text but did not count towards it
-            scoring_ids = assert_scoring_evidence(
-                [i for i in r.evidence_ids if not (i in items and items[i].facts.get("in_window") is False)], accepted_ids)
-            answer_coverage = coverage_state(scoring_ids, source_coverage, factor)
-            budget_gap = not scoring_ids and (factor, dim) in getattr(self, "budget_cut", set())
-            if budget_gap:
-                # some candidate passages for this question were never read by the model: finding nothing is then
-                # not the company having nothing, so this is a gap, never a Level 1 answer
-                answer_coverage = INSUFFICIENT_SOURCE_COVERAGE
-            if answer_coverage == INSUFFICIENT_SOURCE_COVERAGE:
-                # an assessment gap, not an answer: nothing was concluded, so no level is recorded
-                r.recommended_level, r.triggered_rule = NOT_ASSESSED_LEVEL, INSUFFICIENT_SOURCE_COVERAGE
-                r.reason = (BUDGET_GAP_REASON if budget_gap else BLOCKED_REPORT_REASON if source_coverage.blocked_primary_reports else
-                            "Insufficient source coverage \u2014 the system could not access enough reliable company information.")
-                r.next_level_missing = ["Upload the company's sustainability or annual report to continue the assessment."]
-                status, conf = INSUFFICIENT_SOURCE_COVERAGE, 0.2
-                label = label_for(conf)
+                level, status, coverage = NOT_ASSESSED_LEVEL, "REQUIRES_REVIEW", None
+                reason = INSUFFICIENT_EVIDENCE_TEXT + " " + {
+                    A.UNVERIFIED: UNVERIFIED_TEXT, A.BUDGET: BUDGET_TEXT,
+                    A.MODEL_ERROR: NO_LLM_TEXT if not self.llm_available else MODEL_ERROR_TEXT}[ans.outcome]
+                if ans.outcome == A.UNVERIFIED:
+                    notes.append(WITHHELD_NOTE)
+                    if ans.explanation:
+                        reason += f" Suggested explanation (not verified): {ans.explanation}"
+                check_state = ("not_found", "; ".join(ans.errors) or "The answer could not be checked.")
             rec = Recommendation(
-                assessment_id=self.a.id, factor=factor, dimension=dim, recommended_level=r.recommended_level,
-                max_level=r.max_level, evidence_status=status, coverage_state=answer_coverage, triggered_rule=r.triggered_rule, reason=r.reason,
-                ai_reason=r.reason,  # preserved separately so analyst overrides don't lose AI rationale
-                conditions={k: c.as_dict() for k, c in r.conditions.items()}, next_level_missing=r.next_level_missing,
-                notes=notes, evidence_ids=scoring_ids,
-                confidence=conf, confidence_label=label,
-                confidence_breakdown={**breakdown, "used_evidence_ids": scoring_ids, "review_evidence_ids": to_review},
+                assessment_id=self.a.id, factor=q.factor, dimension=q.dimension, recommended_level=level, max_level=q.max_level,
+                evidence_status=status, coverage_state=coverage, triggered_rule=f"rag:{ans.outcome}", reason=reason,
+                ai_reason=reason, conditions={"evidence_verification": {
+                    "label": "Evidence verification", "status": check_state[0],
+                    "evidence_ids": [e.id for e in rows], "detail": check_state[1][:500]}},
+                next_level_missing=next_missing, notes=notes, evidence_ids=[e.id for e in rows],
+                confidence=0.0, confidence_label="Not rated",  # no uncalibrated confidence is presented
+                confidence_breakdown={
+                    "outcome": ans.outcome, "model_calls": ans.calls, "model_seconds": round(ans.seconds, 2),
+                    "retrieved_chunks": [p.label for p in ans.passages], "retrieval_candidates": ans.candidates,
+                    "verification_codes": ans.codes, "proposed_level": ans.proposed_level,
+                },
             )
             self.db.add(rec)
             self.db.flush()
             log_event(self.db, "recommendation_generated", assessment_id=self.a.id, entity_type="recommendation", entity_id=rec.id,
-                      details={"factor": factor, "dimension": dim, "level": r.recommended_level, "rule": r.triggered_rule,
-                               "status": status, "evidence_ids": r.evidence_ids})
+                      details={"factor": q.factor, "dimension": q.dimension, "level": level, "outcome": ans.outcome,
+                               "status": status, "evidence_ids": rec.evidence_ids, "verification": ans.codes})
         self.db.commit()
+        return all_rows
 
 
 def run_assessment(assessment_id: int, session_factory: Callable[[], Session] | sessionmaker | None = None,

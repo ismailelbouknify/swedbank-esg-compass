@@ -140,6 +140,8 @@ class DocumentChunk(Base):
     page_number: Mapped[int | None] = mapped_column(Integer)
     chunk_index: Mapped[int] = mapped_column(Integer)
     text: Mapped[str] = mapped_column(Text)
+    section_heading: Mapped[str | None] = mapped_column(String(300), default=None)
+    content_kind: Mapped[str | None] = mapped_column(String(10), default=None)  # text | table
 
 
 class Evidence(Base):

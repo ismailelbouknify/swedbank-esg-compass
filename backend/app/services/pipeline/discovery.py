@@ -32,7 +32,7 @@ from app.services.documents.report_kind import primary_report_kind
 from app.services.pipeline.source_gate import (
     REPORT_LINK_VIA, apply_source_identity, identity_for, precheck_pdf_identity, record_blocked_pdf_identity,
 )
-from app.services.extraction.patterns import YEAR_RE
+from app.services.documents.text_utils import YEAR_RE
 from app.services.search.base import SearchProvider, SearchResult, build_factor_recovery_queries, build_queries, build_recovery_queries
 from app.services.security import network, policy, robots
 from app.services.security.policy import SourceRejection

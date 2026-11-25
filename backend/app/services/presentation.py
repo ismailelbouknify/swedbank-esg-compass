@@ -25,8 +25,8 @@ PRODUCT_NAME = "Swedbank ESG Compass"
 PRODUCT_SUBTITLE = "Evidence-based sustainability assessment"
 EXPORT_FILE_PREFIX = "swedbank-esg-compass"
 
-REDUCED_MODE_NOTICE = ("Automated reading of the sources ran in a simplified mode for this analysis. "
-                       "All answers should be reviewed by an analyst.")
+REDUCED_MODE_NOTICE = ("Part of the automated analysis could not run on this computer, so some or all questions have "
+                       "no recommended level. All answers should be reviewed by an analyst.")
 
 
 def public_stage(internal_stage: int) -> int:

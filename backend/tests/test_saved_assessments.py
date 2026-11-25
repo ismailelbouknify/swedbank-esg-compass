@@ -95,7 +95,9 @@ def test_rerun_creates_new_version_and_archives_previous(client, monkeypatch):
     name = _name()
     a = _analyse(client, name)
     recs = client.get(f"/api/assessments/{a['id']}/recommendations").json()
-    client.post(f"/api/recommendations/{recs[0]['id']}/review", json={"action": "APPROVE"})
+    # nothing was recommended (no sources): the analyst records a level with a reason
+    client.post(f"/api/recommendations/{recs[0]['id']}/review",
+                json={"action": "OVERRIDE", "selected_level": 1, "comment": "No reporting found in dialogue."})
 
     r = client.post(f"/api/assessments/{a['id']}/rerun")
     assert r.status_code == 202, r.text
@@ -106,7 +108,7 @@ def test_rerun_creates_new_version_and_archives_previous(client, monkeypatch):
     old = client.get(f"/api/assessments/{a['id']}").json()["assessment"]
     assert old["superseded_by_id"] == new["id"]
     # previous result and its analyst decision are archived, not deleted
-    assert client.get(f"/api/recommendations/{recs[0]['id']}").json()["review_status"] == "APPROVED"
+    assert client.get(f"/api/recommendations/{recs[0]['id']}").json()["review_status"] == "OVERRIDDEN"
     assert _lookup(client, name)["completed"]["id"] == new["id"]
     listed = [x["id"] for x in client.get("/api/assessments", params={"q": name}).json()]
     assert listed == [new["id"]]
@@ -158,11 +160,16 @@ def test_analyst_approval_and_override(client, monkeypatch):
     a = _analyse(client, _name())
     recs = client.get(f"/api/assessments/{a['id']}/recommendations").json()
     assert all(r["review_state"] == "no_evidence" for r in recs)  # nothing reviewed -> all gaps
-    ok = client.post(f"/api/recommendations/{recs[0]['id']}/review", json={"action": "APPROVE"}).json()
-    assert ok["review_state"] == "approved" and ok["final_level"] == ok["recommended_level"]
+    # no evidence means no recommended level: there is nothing to approve, never an automatic Level 1
+    assert all(r["recommended_level"] == 0 for r in recs)
+    refused = client.post(f"/api/recommendations/{recs[0]['id']}/review", json={"action": "APPROVE"})
+    assert refused.status_code == 422
+    ok = client.post(f"/api/recommendations/{recs[0]['id']}/review",
+                     json={"action": "OVERRIDE", "selected_level": 1, "comment": "Confirmed: no reporting."}).json()
+    assert ok["review_state"] == "changed" and ok["final_level"] == 1
     ch = client.post(f"/api/recommendations/{recs[1]['id']}/review",
                      json={"action": "OVERRIDE", "selected_level": 2, "comment": "Informal goals seen in dialogue."}).json()
-    assert ch["review_state"] == "changed" and ch["final_level"] == 2 and ch["recommended_level"] == 1
+    assert ch["review_state"] == "changed" and ch["final_level"] == 2 and ch["recommended_level"] == 0
     assert ch["analyst_comment"] == "Informal goals seen in dialogue."
     s = client.get(f"/api/assessments/{a['id']}").json()
     assert s["reviewed"] == 2

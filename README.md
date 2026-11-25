@@ -2,14 +2,17 @@
 
 A local web application that prepares **evidence-backed recommended answers** to an ESG ambition questionnaire
 (Reporting, and per material factor Planning / Execution / Performance Improvement) for a company and year.
-Analysts review every recommendation, approve or override it, and export the result.
+Analysts review every recommendation, approve or change it, and export the result.
 
-The key design principle:
+The design principle is a simple, evidence-grounded RAG:
 
-> **LLM = "What facts exist?"   Python rules = "Which questionnaire answer do those facts correspond to?"**
+> **No supporting evidence = no generated answer.**
+> The local model reads the questionnaire criteria and the retrieved passages and recommends a level with exact
+> quotations. Python verifies the references and the response's integrity. The analyst makes the final decision.
 
-A small local model (~1B, CPU-only) only reads short passages and returns structured facts. It never picks a level.
-Deterministic Python rules map verified facts to levels, and every level is traceable to source, page and quote.
+A small local model (~1B, CPU-only) answers one questionnaire question per call from a handful of retrieved passages.
+Every recommended level carries quotations that were found, word for word, in the company's own sources; an answer
+whose quotations cannot be verified is withheld. Nothing is ever converted into a low level for lack of evidence.
 
 ---
 
@@ -22,42 +25,52 @@ Deterministic Python rules map verified facts to levels, and every level is trac
    navigation and sitemaps (robots.txt respected, fixed limits). When search is unavailable or thin, the same is done
    for the official domain the identity check settled. Search and website retrieval are independent: a search service
    that declines automated searches stops searching only (see "Source coverage").
-3. **Documents** are extracted page-by-page (PyMuPDF), tables enriched with pdfplumber where useful, split into
-   page-aware chunks.
-4. **Retrieval**: BM25 + factor/dimension keyword dictionaries select a few relevant passages per question; a cheap
-   regex signal re-ranks them. Whole reports are never sent to the model.
-5. **Extraction**: regexes handle the trivial (years, percentages, frameworks, assurance wording, KPI tables); the local
-   LLM interprets context in 300–1500-token prompts and returns JSON (goal found? formalised? quantitative? target
-   year? owner? benchmark?). Python then cross-checks every LLM claim (a benchmark/owner must be explicitly worded in
-   the source, "public" comes from source metadata, not from the model).
-6. **Verification**: each evidence item is checked — quote exists on the stated page, numbers/years in the facts appear
-   in the source text, relevant to the factor and to the dimension. Failures are marked `REQUIRES_REVIEW` and never
-   used to raise a level.
-7. **Rules** (`backend/app/services/scoring/`) compute the recommended level, triggered rule, supporting evidence IDs,
-   conditions met / not found, what is missing for the next level, and a confidence category.
-8. **Review**: the analyst approves or overrides (level + mandatory comment). Everything is in an audit trail.
-9. **Export**: JSON, CSV, Excel (Assessment / Evidence / Sources / Analyst Decisions sheets).
+3. **Identity**: every source is checked against the assessed company (name, organisation number, official domain);
+   another company's document never reaches the model.
+4. **Documents** are extracted page-by-page (PyMuPDF), tables enriched with pdfplumber, and split into overlapping
+   chunks of about 350 tokens (60 overlap). Each chunk keeps its source, page, section heading, report year and table
+   context; a table split across chunks repeats its header row, so figures stay next to their labels, units and years.
+5. **Retrieval**: for each of the 16 questions, BM25 ranks all chunks of the company's accepted sources against a query
+   built from the question, the factor and the level definitions. Near-duplicates are removed and the best 6–8
+   passages that fit the model's context window are kept. No passage is discarded for lacking a predefined keyword.
+6. **Answering**: one local-model call per question with the company, year, factor, dimension, the exact question,
+   the complete level definitions from the questionnaire, and the passages with their chunk IDs. The model returns
+   JSON: `EVIDENCE_FOUND` with a level, an explanation and exact quotations with chunk IDs, or `INSUFFICIENT_EVIDENCE`.
+   With llama.cpp the output is grammar-constrained to exactly two structures: a supported answer (`EVIDENCE_FOUND`,
+   an integer level of the question's scale, an explanation, 1–3 quotations citing given chunk IDs) or an unsupported
+   answer (`INSUFFICIENT_EVIDENCE`, level `null`, an explanation, no quotations). Status, level and evidence are
+   coupled, so "evidence found" without a level, or a level without a quotation, cannot be generated.
+7. **Verification** (generic, no ESG rules): valid JSON; level within the question's scale; no level without
+   quotations; every chunk ID is one of the passages given; every quotation is in the cited chunk (only whitespace and
+   typographic normalisation); the chunk is from an accepted source of the company (a third-party or group source
+   must name the company). A failed answer gets one corrective retry; if it fails again, no level is recommended and
+   the question is flagged for review with the suggestion shown as unverified.
+8. **Review**: the analyst approves the AI-recommended level, or sets a level with a mandatory comment. AI and analyst
+   levels are kept and shown separately. Everything is in an audit trail.
+9. **Export**: JSON, CSV, Excel (Assessment / Evidence / Data Gaps / Sources / Analyst Decisions sheets).
 
-"Not found" is never presented as "does not exist": gaps read *"No evidence of … was found in the reviewed sources."*
-Recommendation statuses: `FOUND`, `NO_EVIDENCE_FOUND`, `CONFLICTING_EVIDENCE`, `REQUIRES_REVIEW`.
+Each answer is one of: a level with verified quotations (`EVIDENCE_FOUND`); `NO_EVIDENCE_FOUND` (adequate company
+sources were reviewed and nothing supported a level); `INSUFFICIENT_SOURCE_COVERAGE` (the sources were missing,
+inaccessible or inadequate); or `REQUIRES_REVIEW` (an answer was withheld because it could not be verified or the
+model could not run). The last three record no level ("Insufficient evidence to recommend an assessment level.");
+a Level 1 is only ever recommended when quoted evidence supports it.
 
-The methodology (level definitions) follows the ESG-76398 questionnaire and lives in
-`backend/app/config/esg_rules.json`.
+The methodology (questions, level definitions, scales) follows the ESG-76398 questionnaire and lives, unchanged, in
+`backend/app/config/esg_rules.json`. The model applies it; Python does not.
 
 ## 2. Architecture
 
 ```
 PDF upload ─┐
-Website  ───┼─► Sources ─► Documents/pages ─► chunks ─► BM25 + re-rank ─► passages (per factor × dimension)
-Web search ─┘                                                                     │
-                                          regex facts ◄──────────────────────────┤
-                                          local 1B LLM facts (JSON) ◄────────────┘
-                                                      │
-                                   Verification (quote/page/numbers/relevance)
-                                                      │
-                               Deterministic rules (reporting/planning/execution/performance)
-                                                      │
-                         Recommendation + evidence IDs + confidence ─► Analyst review ─► Export
+Website  ───┼─► Sources ─► identity check ─► text + tables ─► chunks (~350 tokens, page/section/table context)
+Web search ─┘                                                        │
+                                       per question: BM25 over accepted sources ─► 6–8 passages (fit the context)
+                                                        │
+                       local 1B model: questionnaire criteria + passages ─► JSON level, explanation, quotations
+                                                        │
+          verification: JSON · scale · chunk IDs · quotations in chunk · company source  (one corrective retry)
+                                                        │
+        verified level + quotations │ no level: no evidence / insufficient coverage / withheld ─► Analyst ─► Export
 ```
 
 ```
@@ -66,20 +79,19 @@ ESG/
     app/
       main.py                 FastAPI app (also serves frontend/dist if built)
       api/                    REST endpoints
-      config/esg_rules.json   questionnaire: factors, levels, keywords, metrics, rule parameters
+      config/esg_rules.json   questionnaire: factors, questions, level definitions, scales, retrieval vocabulary
       core/config.py          settings (env / backend/.env)
       db/, models/            SQLAlchemy (SQLite; PostgreSQL via DATABASE_URL)
       schemas/                Pydantic models
       services/
-        company/              name normalisation, official-source classification
-        search/               SearchProvider interface: DDGS, SerpAPI
-        documents/            PDF (PyMuPDF), tables (pdfplumber), HTML (trafilatura/BS4), safe fetcher, OCR stub
+        company/              name normalisation, company identity, official-source classification
+        search/               SearchProvider interface: DDGS, DuckDuckGo lite, SerpAPI
+        security/             safe fetcher, PAC/Kerberos proxy, TLS, robots.txt, SSRF checks
+        documents/            PDF (PyMuPDF), tables (pdfplumber), HTML (trafilatura/BS4), text helpers
         retrieval/            chunker, BM25
+        rag/                  questions, retrieval, prompt, verify, answer   <- the assessment method
         llm/                  base.py, llama_cpp_provider.py, ollama_provider.py, JSON parsing
-        extraction/           regex patterns, prompts, FactExtractor
-        verification/         evidence verification
-        scoring/              reporting.py, planning.py, execution.py, performance.py, confidence.py
-        pipeline/             discovery, ingestion, runner (background job)
+        pipeline/             discovery, ingestion, identity gate, source coverage, runner (background job)
         export/               JSON / CSV / XLSX
     tests/
   frontend/                   React + TypeScript + Vite
@@ -89,6 +101,23 @@ ESG/
 
 Background work uses FastAPI `BackgroundTasks` in-process with progress stored on the assessment row
 (no Celery/Redis/Kafka).
+
+### Measured comparison
+
+`docs/simple-rag-benchmark.md` compares baseline-v2.4 with this design on two fixed documents (same model, questions and
+laptop): coverage, every recommended level, quotations, model calls, time and memory, plus a labelled manual review of
+answer correctness. In short: the corrected RAG answers more questions with verified quotations and never invents a
+level for missing evidence, but with the 1B model many of those answers rest on a genuine quotation that does not
+support them, and each assessment takes longer (larger prompts). More answers is not the same as more correct answers.
+
+### Removed in the simple-RAG redesign
+
+The deterministic scoring engine (`services/scoring/`: reporting, planning, execution, performance rule tables and
+confidence), the fact extractor with its pre-filters and per-factor/actor/state/table gates (`services/extraction/`,
+785 lines of ESG regex patterns), the multi-stage evidence verifier (`services/verification/`), the deterministic
+quote fallback, the keyword/regex "heuristic mode" without a model, rule-based level overrides and the confidence
+score. The `*_rules` and `confidence` sections of `esg_rules.json` are no longer read (left in place so the
+questionnaire file is unchanged).
 
 ## 3. Requirements
 
@@ -130,7 +159,7 @@ All in `backend/.env` (see `backend/.env.example`):
 | `LLM_PROVIDER` | `llama_cpp` | `llama_cpp`, `ollama` or `none` |
 | `LOCAL_LLM_MODEL_PATH` | `../models/model.gguf` | GGUF path (relative to `backend/`) |
 | `OLLAMA_BASE_URL` / `OLLAMA_MODEL` | `http://localhost:11434` / `llama3.2:1b` | Ollama settings |
-| `ALLOW_HEURISTIC_FALLBACK` | `true` | analyse with keyword/regex extraction when no model |
+| `ALLOW_HEURISTIC_FALLBACK` | `true` | without a model, still gather and list sources (no level is recommended) instead of failing |
 | `SEARCH_PROVIDER` | `ddgs` | `ddgs` (no key), `duckduckgo_lite` (no key, application transport), `serpapi` (+`SERPAPI_API_KEY`), `none` |
 | `MAX_SEARCH_RESULTS` | `10` | results downloaded from search |
 | `MAX_PAGES_PER_SITE` | `10` | HTML pages fetched per assessment |
@@ -142,7 +171,10 @@ All in `backend/.env` (see `backend/.env.example`):
 | `MAX_DOWNLOADED_PDFS` | `3` | PDFs downloaded per assessment |
 | `MAX_PDF_SIZE_MB` | `100` | upload limit (automatic retrieval: `MAX_DOWNLOAD_MB`, `100`) |
 | `MAX_PDF_PAGES` | `0` | page-count limit; `0` = none |
-| `MAX_CHUNKS_PER_QUESTION` | `4` | passages per factor × dimension sent to the LLM |
+| `CHUNK_SIZE_TOKENS` / `CHUNK_OVERLAP_TOKENS` | `350` / `60` | chunk size and overlap (approximate model tokens) |
+| `RAG_CHUNKS_PER_QUESTION` | `7` | passages per question (fewer if they do not fit `LLM_CONTEXT_TOKENS`) |
+| `LLM_CONTEXT_TOKENS` / `LLM_MAX_OUTPUT_TOKENS` | `4096` / `400` | model context window / answer length |
+| `MAX_LLM_CALLS_PER_ASSESSMENT` | `100` | safety ceiling on model calls (normal use: 16, plus at most one retry each) |
 
 ## 8. How to run
 
@@ -192,33 +224,38 @@ Demo: build the synthetic PDF (`python sample_data/build_sample_pdf.py` with the
 
 ```bash
 cd backend
-pytest               # 73 tests; the LLM is mocked — no model needed
+pytest               # the model is replaced by a deterministic test double — no model needed
 cd ../frontend
 npm run lint         # TypeScript type-check
 npm run build
 npm test             # branding present, old product name gone, no model/technical terms (UI + bundle)
 ```
 
-Covered: PDF extraction (incl. OCR_REQUIRED), chunking, BM25, regex extraction (years, %, tables, from/to changes,
-frameworks, assurance), all four rule engines, no-evidence wording, confidence, LLM JSON parsing, hallucination
-handling with a mocked LLM, URL/SSRF validation, upload validation, API creation, analyst override, full pipeline
-runs (fallback and mocked-LLM), exports.
+Covered: PDF/HTML extraction (incl. OCR_REQUIRED), chunking (pages, sections, table headers), retrieval (no keyword
+filter, near-duplicates, context budget), the prompt (verbatim criteria, untrusted-passage delimiters), verification
+(invented quotations, invalid chunk IDs, invalid levels, malformed JSON, multiple quotations, table figures, wrong
+company and third-party sources), the corrective retry and call ceiling, the three no-level states, company identity,
+search/website/PAC/Kerberos/robots.txt behaviour, analyst review and exports. Tests named `LIMITATION` show what
+verification does not guarantee: a genuine quotation can still be attached to a wrong conclusion.
 
 ## 10. Limitations
 
-- **Keyword fallback ≠ LLM.** Without a model, facts come from regex/keyword rules: decent on well-structured reports,
-  noisy on others (e.g. a table row may be mapped to a loosely matching metric). All such results are capped at Medium
-  confidence and flagged *Requires review*.
-- The LLM path is covered by tests with a mocked model; quality with a real 1B model depends on the model — small
-  models paraphrase and miss nuance, which is why every claim is re-verified in Python.
-- CPU speed: roughly 5–20 s per LLM call; an assessment makes up to ~60 calls (prefilters skip most passages).
+- **A verified quotation is not a verified conclusion.** Python checks that the cited words are in the company's
+  sources, not that they meet the level's criteria. A 1B model can over-read a target as "ambitious", take a
+  government programme for company activity, or ignore the time window; the analyst decides. Measure semantic
+  accuracy against reviewed reference scores before relying on it.
+- **Small model.** Llama 3.2 1B on CPU follows the JSON format reliably (grammar-constrained with llama.cpp) but its
+  reading of nuanced criteria is limited; it may also abstain where a person would see evidence.
+- **Instructions inside sources** cannot forge passages or sources (delimiters are stripped), but a model may still
+  follow them; any such answer is a suggestion pending analyst review.
+- **Without the model** no level is recommended; sources are still gathered and listed.
+- CPU speed: one call per question (16 per assessment, plus retries), each with a ~2–3k-token prompt.
 - Levels 2–3 of Planning (informal / internal goals) normally need dialogue with the company; public documents
   rarely support them. Level 6 benchmarks and Performance level 3 rely on the company's own comparison statements.
-- "Last three years" windows use the assessment year; undated activities fall back to the report year.
 - Reporting level 2 ("regulatory only") vs. 3 is hard to distinguish from public text.
 - No OCR (image-only PDFs are marked `OCR_REQUIRED`); no JavaScript rendering unless Playwright is added.
-- Web discovery depends on DuckDuckGo availability and may pick up pages about similarly-named companies (they are
-  ranked lower and labelled by source type). Some sites block automated downloads (recorded as `FAILED`).
+- Web discovery depends on search availability; keyless DuckDuckGo may decline a sequence of searches (then the
+  official website is read directly, see "Source coverage").
 - The General Section questions of the reference questionnaire (exclusion list, position statements) and its free-text
   comment are not automated.
 - SQLite + in-process background tasks: runs interrupted by a server restart are marked failed and can be re-run.
@@ -273,7 +310,7 @@ Search (if enabled) -> URL + DNS/IP check (no local/private targets) -> bounded 
      (only images, media, fonts, archives, executables and scripts are refused unread)
        HTML: extract text in memory
        PDF:  malware scan hook -> text extraction from the in-memory bytes -> bytes discarded
-  -> company/source validation -> retrieval -> evidence validation -> local LLM -> deterministic scoring
+  -> company/source validation -> chunking -> retrieval -> local LLM answer -> lightweight verification -> analyst
 ```
 
 | Control | Behaviour | Settings |
@@ -383,28 +420,16 @@ Add an entry to `factors` in `backend/app/config/esg_rules.json`:
 }
 ```
 
-That is all: retrieval queries, extraction prompts, scoring, UI table and exports pick it up automatically
-(`keywords` drive retrieval and relevance checks; `metrics` map KPI rows to a direction for improvement calculations).
+That is all: the factor's three questions, retrieval queries, prompts, UI table and exports pick it up automatically
+(`keywords` and `metrics` only steer retrieval).
 
-## 13. Modifying scoring rules
+## 13. Changing the questionnaire or the answering method
 
-- Level texts, search terms and rule parameters: `backend/app/config/esg_rules.json`
-  (`dimensions.*.levels`, `reporting_rules`, `planning_rules.benchmark_terms`, `planning_rules.require_clear_ownership_for_level_5`,
-  `performance_rules.sector_leading_terms`, `lookback_years`, `confidence.weights`/`thresholds`, source priorities).
-- Rule logic: `backend/app/services/scoring/` — each dimension has a pure rule table
-  (`decide_reporting_level`, `decide_planning_level`, `decide_execution_level`, `evaluate_series`) plus a scorer that
-  aggregates verified evidence. Scorers take structured facts, never LLM prose. Add a test in
-  `backend/tests/test_scoring.py` for every rule change.
-
-Methodology choices made for this MVP (documented so they can be changed):
-
-- Planning level 5 does not *require* evidenced ownership by default (the questionnaire mentions it); missing ownership
-  is shown as "?" with a note. Set `require_clear_ownership_for_level_5: true` to enforce it.
-- Planning level 6 needs explicit benchmark wording (SBTi, Paris, EU Taxonomy, peers/sector average, …) in the goal
-  statement or on the same page — a large number alone is never "ambitious".
-- Execution level 3 requires both an activity explicitly linked to goals/strategy **and** a formalised goal found by
-  Planning.
-- Performance improvement is computed in Python from reported values (earliest vs latest within the last three years);
-  unquantified claims are recorded but never scored. Performance level 3 is always flagged for review.
-- Reporting level 6 requires framework-based reporting (level 5) plus independent assurance of sustainability
-  information (a financial audit alone does not count).
+- Questions, level definitions and scales: `dimensions.*` in `backend/app/config/esg_rules.json`. They are passed to
+  the model verbatim, so a wording change changes what the model is asked to apply.
+- Retrieval vocabulary: `dimensions.*.query_terms` and each factor's `keywords`.
+- The prompt: `backend/app/services/rag/prompt.py` (system rules, answer format, passage layout).
+- Verification: `backend/app/services/rag/verify.py` (generic integrity checks only; do not add ESG rules there — the
+  analyst decides whether a verified quotation really meets a level).
+- Sizes: `CHUNK_SIZE_TOKENS`, `CHUNK_OVERLAP_TOKENS`, `RAG_CHUNKS_PER_QUESTION`, `LLM_CONTEXT_TOKENS`,
+  `LLM_MAX_OUTPUT_TOKENS`, `MAX_LLM_CALLS_PER_ASSESSMENT` (a ceiling: 16 calls plus at most one retry each).

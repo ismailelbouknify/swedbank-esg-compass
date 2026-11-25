@@ -106,7 +106,7 @@ export interface Recommendation {
   next_level_missing: string[];
   notes: string[];
   evidence_ids: number[];
-  confidence_label: "High" | "Medium" | "Low";
+  confidence_label: string; // "Not rated": no uncalibrated confidence is presented
   review_status: ReviewStatus;
   review_state: ReviewState;
   final_level: number | null;

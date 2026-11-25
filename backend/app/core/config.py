@@ -34,12 +34,11 @@ class Settings(BaseSettings):
     local_llm_model_path: str = str(PROJECT_DIR / "models" / "model.gguf")
     llm_context_tokens: int = 4096
     llm_threads: int = 0  # 0 = let llama.cpp decide
-    llm_max_output_tokens: int = 384
+    llm_max_output_tokens: int = 400  # one answer: status, level, explanation, up to three quotations
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3.2:1b"
     llm_timeout_seconds: int = 180
-    # When no local LLM is configured, fall back to deterministic keyword/regex
-    # fact extraction (clearly labelled, lower confidence) instead of failing.
+    # When no local LLM is available, still gather and list the sources (no level is recommended) instead of failing.
     allow_heuristic_fallback: bool = True
 
     # --- Search / web ----------------------------------------------------
@@ -106,19 +105,14 @@ class Settings(BaseSettings):
     recovery_time_budget_seconds: float = 180
     recovery_search_pause_seconds: float = 1.0
 
-    # --- Retrieval / extraction ------------------------------------------
-    chunk_size_words: int = 180
-    chunk_overlap_words: int = 40
-    # Passages sent to extraction per factor x dimension question. Each can cost one LLM call,
-    # so keep this small for CPU inference; the keyword fallback can afford more.
-    max_chunks_per_question: int = 4
-    # Hard limit on model calls per assessment (~24 s each on CPU). Passages are handed out round-robin over all
-    # factor x dimension questions, so the best passage of every question is read first; anything beyond the
-    # limit goes to the deterministic extractor and is verified like everything else. 0 = no limit.
+    # --- Chunking / retrieval / answering ---------------------------------
+    chunk_size_tokens: int = 350  # approximate model tokens per chunk
+    chunk_overlap_tokens: int = 60
+    # Passages given to the model per question, fewer when they do not fit the context window (LLM_CONTEXT_TOKENS).
+    rag_chunks_per_question: int = 7
+    # Safety ceiling on model calls per assessment, not a target: one call per question (16), plus at most one
+    # corrective retry each. 0 = no ceiling.
     max_llm_calls_per_assessment: int = 100
-    heuristic_chunks_per_question: int = 10
-    retrieval_candidates: int = 30  # BM25 candidates re-ranked by a cheap regex signal
-    max_llm_context_chars: int = 6000  # ~1500 tokens of passage text
 
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
