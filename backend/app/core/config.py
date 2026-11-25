@@ -47,12 +47,13 @@ class Settings(BaseSettings):
     serpapi_api_key: str = ""
     max_search_results: int = 10
     max_pages_per_site: int = 10
-    max_pdf_size_mb: int = 50  # manual uploads
-    max_download_mb: int = 50  # any automatically retrieved document, held in memory
-    max_html_size_mb: int = 5
-    max_pdf_pages: int = 500
+    # Resource safeguards, not source restrictions: they bound memory and time per document.
+    max_pdf_size_mb: int = 100  # manual uploads
+    max_download_mb: int = 100  # any automatically retrieved document, held in memory
+    max_html_size_mb: int = 10
+    max_pdf_pages: int = 0  # 0 = no page-count limit (size and MAX_SOURCE_PROCESSING_SECONDS still bound a PDF)
     max_downloaded_pdfs: int = 3
-    max_redirects: int = 5
+    max_redirects: int = 10  # hop cap: also stops redirect loops
     max_http_retries: int = 2
     http_connect_timeout_seconds: float = 10
     http_read_timeout_seconds: float = 30

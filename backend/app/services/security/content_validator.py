@@ -21,9 +21,16 @@ log = logging.getLogger(__name__)
 PDF_SIGNATURE = b"%PDF-"
 HTML_TYPES = ("text/html", "application/xhtml+xml")
 PDF_TYPES = ("application/pdf", "application/x-pdf")
-# Download endpoints and CDNs often serve reports under a generic type (or none): the bytes decide.
-GENERIC_BINARY_TYPES = ("", "application/octet-stream", "binary/octet-stream", "application/download",
-                        "application/x-download", "application/force-download", "application/unknown")
+# Types that are never a report: refused before the body is read. Every other type (octet-stream, text/plain,
+# vendor-specific or missing) is read within the size limit and the bytes decide; a PDF needs its signature.
+NON_DOCUMENT_PREFIXES = ("image/", "audio/", "video/", "font/", "model/")
+NON_DOCUMENT_TYPES = frozenset({
+    "application/zip", "application/x-zip-compressed", "application/gzip", "application/x-gzip", "application/x-tar",
+    "application/x-7z-compressed", "application/x-rar-compressed", "application/vnd.rar",
+    "application/x-msdownload", "application/x-msdos-program", "application/vnd.microsoft.portable-executable",
+    "application/x-executable", "application/x-sh", "application/java-archive", "application/wasm",
+    "application/javascript", "application/x-javascript", "text/javascript", "text/css",
+})
 
 
 class ContentRejected(SourceRejection):
@@ -80,15 +87,15 @@ def url_path_is_pdf(url: str) -> bool:
 
 
 def classify_content_type(content_type: str) -> str | None:
-    """Declared type before the body is read: 'pdf', 'html', 'unknown' (generic; decided by the bytes)
-    or None (images, archives, media...: not processed, and not downloaded)."""
+    """Declared type before the body is read: 'pdf', 'html', 'unknown' (decided by the bytes)
+    or None (images, archives, media, scripts...: not processed, and not downloaded)."""
     if content_type in HTML_TYPES:
         return "html"
     if content_type in PDF_TYPES:
         return "pdf"
-    if content_type in GENERIC_BINARY_TYPES:
-        return "unknown"
-    return None
+    if content_type in NON_DOCUMENT_TYPES or content_type.startswith(NON_DOCUMENT_PREFIXES):
+        return None
+    return "unknown"
 
 
 _HTML_MARKERS = (b"<!doctype html", b"<html", b"<head", b"<body")
@@ -108,10 +115,10 @@ def validate_pdf_signature(content: bytes) -> None:
 
 
 def enforce_page_limit(page_count: int) -> None:
-    """Over-limit documents are rejected, never silently truncated: an ESG score must not rest on
-    part of a report without anyone knowing."""
+    """Off by default (MAX_PDF_PAGES=0). When configured, over-limit documents are rejected, never silently
+    truncated: an ESG score must not rest on part of a report without anyone knowing."""
     limit = get_settings().max_pdf_pages
-    if page_count > limit:
+    if limit > 0 and page_count > limit:
         raise ContentRejected(policy.PDF_PAGE_LIMIT_EXCEEDED, f"PDF has {page_count} pages (limit {limit})")
 
 

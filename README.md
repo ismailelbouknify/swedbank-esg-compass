@@ -132,7 +132,8 @@ All in `backend/.env` (see `backend/.env.example`):
 | `MAX_SEARCH_RESULTS` | `10` | results downloaded from search |
 | `MAX_PAGES_PER_SITE` | `10` | HTML pages fetched per assessment |
 | `MAX_DOWNLOADED_PDFS` | `3` | PDFs downloaded per assessment |
-| `MAX_PDF_SIZE_MB` | `50` | upload & download limit |
+| `MAX_PDF_SIZE_MB` | `100` | upload limit (automatic retrieval: `MAX_DOWNLOAD_MB`, `100`) |
+| `MAX_PDF_PAGES` | `0` | page-count limit; `0` = none |
 | `MAX_CHUNKS_PER_QUESTION` | `4` | passages per factor × dimension sent to the LLM |
 
 ## 8. How to run
@@ -245,7 +246,8 @@ parsed for text, never opened, rendered or executed:
 
 ```
 Search (if enabled) -> URL + DNS/IP check (no local/private targets) -> bounded request -> re-check every redirect
-  -> size checks; the bytes decide the type (%PDF- signature or HTML markup), not the URL or a generic header
+  -> size checks; the bytes decide the type (%PDF- signature or HTML markup), not the URL or the declared header
+     (only images, media, fonts, archives, executables and scripts are refused unread)
        HTML: extract text in memory
        PDF:  malware scan hook -> text extraction from the in-memory bytes -> bytes discarded
   -> company/source validation -> retrieval -> evidence validation -> local LLM -> deterministic scoring
@@ -258,11 +260,11 @@ Search (if enabled) -> URL + DNS/IP check (no local/private targets) -> bounded 
 | Network targets | Every address a host resolves to must be public (private, loopback, link-local, metadata, multicast and reserved ranges are refused, for IPv4, IPv6 and IPv4 embedded in IPv6). A direct connection is pinned to the validated address; through a configured proxy, see "Managed networks" below | |
 | Proxy and certificates | Only an already-configured proxy is used (environment variables or Windows settings, or an explicit setting). Certificates are always verified, against the organisation's bundle or the operating-system store | `WEB_PROXY_MODE`, `WEB_PROXY_URL`, `USE_SYSTEM_TRUST_STORE`, `WEB_CA_BUNDLE` |
 | Early stop | After repeated network-level failures with nothing getting through, automatic access stops for that assessment and the reason is shown | `WEB_ACCESS_FAILURE_LIMIT`, `SEARCH_TIMEOUT_SECONDS` |
-| Redirects | Up to 5, to any public host (e.g. corporate site to CDN); each target is checked like a new URL, so a redirect cannot reach a local or internal address. Cookies last for one redirect chain | `MAX_REDIRECTS` |
-| Size and pages | Limit checked from `Content-Length` and again while streaming. Over-limit PDFs are rejected, not truncated; such a report can be reviewed, then uploaded manually if it fits the upload limits | `MAX_DOWNLOAD_MB`, `MAX_HTML_SIZE_MB`, `MAX_PDF_PAGES`, `MAX_PDF_SIZE_MB` (uploads) |
+| Redirects | Up to 10 (the hop cap also ends redirect loops), to any public host (e.g. corporate site to CDN); each target is checked like a new URL, so a redirect cannot reach a local or internal address. Cookies last for one redirect chain | `MAX_REDIRECTS` |
+| Size and pages | Configurable resource safeguards, not source restrictions: 100 MB per document, 10 MB per page, no page-count limit by default. Size is checked from `Content-Length` and again while streaming. Over-limit PDFs are rejected, not truncated; such a report can be reviewed, then uploaded manually if it fits the upload limits | `MAX_DOWNLOAD_MB`, `MAX_HTML_SIZE_MB`, `MAX_PDF_PAGES`, `MAX_PDF_SIZE_MB` (uploads) |
 | Time | Connect and read timeouts, a total limit per source, bounded retries with backoff | `HTTP_CONNECT_TIMEOUT_SECONDS`, `HTTP_READ_TIMEOUT_SECONDS`, `MAX_SOURCE_PROCESSING_SECONDS`, `MAX_HTTP_RETRIES` |
 | External PDFs and pages | Held in memory only, released after text extraction, never written to disk (no temporary files either) or to the database, in any mode. Only the URL, metadata, extracted text and evidence are kept | |
-| Uploads | PDF only: extension, content type, signature, size, page count, encryption. Stored under generated names | `MAX_PDF_SIZE_MB`, `MAX_PDF_PAGES` |
+| Uploads | PDF only: extension, content type, signature, size, page count (if `MAX_PDF_PAGES` is set), encryption. Stored under generated names | `MAX_PDF_SIZE_MB`, `MAX_PDF_PAGES` |
 | Local LLM | All retrieval, extraction, validation and scoring run locally. No cloud LLM exists in the code, and a non-local Ollama endpoint is refused in this mode | `LLM_PROVIDER`, `OLLAMA_BASE_URL` |
 | Web server | Answers only the configured Host names, sends security headers, no CDN-backed API docs. `BANK_SAFE_MODE` governs this and the local-LLM rule only, not web access | `ALLOWED_HOSTS` |
 

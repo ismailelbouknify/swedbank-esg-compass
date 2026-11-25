@@ -320,16 +320,41 @@ def test_legitimate_redirects_to_other_public_hosts_are_followed(dns):
                     "https://cdn.company-assets.example/files/ar-2025.pdf"]
 
 
-def test_default_redirect_limit_allows_five_hops(dns):
-    assert get_settings().max_redirects == 5
+def test_default_redirect_limit_allows_ten_hops(dns):
+    assert get_settings().max_redirects == 10
 
     def handler(request):
         n = int(request.url.path.strip("/") or 0)
-        return httpx.Response(302, headers={"location": f"/{n + 1}"}) if n < 5 else httpx.Response(
+        return httpx.Response(302, headers={"location": f"/{n + 1}"}) if n < 10 else httpx.Response(
             200, headers={"content-type": "text/html"}, content=HTML)
 
     with client_for(handler) as client:
-        assert fetch("https://public.example/", client=client).final_url == "https://public.example/5"
+        assert fetch("https://public.example/", client=client).final_url == "https://public.example/10"
+
+
+def test_redirect_loop_stops_at_the_hop_cap(dns):
+    hops = []
+
+    def handler(request):
+        hops.append(request.url.path)
+        return httpx.Response(302, headers={"location": "/b" if request.url.path == "/a" else "/a"})
+
+    with client_for(handler) as client, pytest.raises(FetchError) as e:
+        fetch("https://public.example/a", client=client)
+    assert e.value.code == policy.TOO_MANY_REDIRECTS
+    assert len(hops) == get_settings().max_redirects + 1
+
+
+@pytest.mark.parametrize("ctype", ["text/plain", "application/x-unknown-content-type", "application/vnd.ms-pdf", "binary/pdf"])
+def test_report_served_under_an_unusual_type_is_decided_by_its_bytes(ctype, dns):
+    with client_for(lambda r: httpx.Response(200, headers={"content-type": ctype}, content=PDF_BYTES)) as client:
+        assert fetch("https://public.example/download?id=1", client=client).kind == "pdf"
+
+
+def test_unusual_type_without_a_document_inside_is_still_refused(dns):
+    with client_for(lambda r: httpx.Response(200, headers={"content-type": "text/plain"}, content=b"just text")) as client,             pytest.raises(FetchError) as e:
+        fetch("https://public.example/notes.txt", client=client)
+    assert e.value.code == policy.INVALID_CONTENT_TYPE
 
 
 def test_cookies_are_kept_along_one_redirect_chain_and_cleared_after(dns):
@@ -534,6 +559,11 @@ def test_not_a_pdf_stops_at_the_first_read(dns):
     assert sent["chunks"] * 1002 <= 2 * safe_fetch.READ_CHUNK_BYTES  # not the whole 20 MB allowance
 
 
+def test_no_page_count_limit_by_default():
+    assert Settings(_env_file=None).max_pdf_pages == 0
+    assert extract_pdf(make_pdf(600)).page_count == 600
+
+
 def test_too_many_pdf_pages_rejected_not_truncated(configure):
     configure(max_pdf_pages=3)
     assert extract_pdf(make_pdf(3)).page_count == 3
@@ -667,7 +697,7 @@ def test_security_defaults():
     s = Settings(_env_file=None)
     assert s.bank_safe_mode is True
     assert s.enable_playwright is False
-    assert s.max_redirects == 5 and s.max_download_mb == 50 and s.max_pdf_pages == 500
+    assert s.max_redirects == 10 and s.max_download_mb == 100 and s.max_pdf_size_mb == 100 and s.max_pdf_pages == 0
     assert s.http_connect_timeout_seconds > 0 and s.http_read_timeout_seconds > 0 and s.max_source_processing_seconds > 0
     # there is no switch that stores automatically retrieved files, and no domain allowlist to maintain
     for removed in ("store_downloaded_files", "allowed_external_domains", "allow_http", "download_dir"):
