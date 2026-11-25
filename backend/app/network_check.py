@@ -4,7 +4,12 @@
     python -m app.network_check                       # checks https://www.example.com/
     python -m app.network_check https://www.company.com/
     python -m app.network_check --retrieval-only [url]    # website retrieval only
-    python -m app.network_check --search-only             # web search only
+    python -m app.network_check --search-only             # web search only (one query, then a paced sequence)
+    python -m app.network_check --website https://www.company.com/   # also: discovery on the company's own site
+
+Single-search connectivity (one query gets through) is reported apart from sustained discovery capability (a short
+sequence of queries paced as in an assessment, and whether the company's own site can be explored without search):
+a search service may answer one query and decline the next few.
 
 It makes the same requests the application makes, through the same proxy and certificate settings, and says
 what stopped them. It changes nothing, stores nothing and prints no credentials. It does not try to get around
@@ -47,6 +52,8 @@ EXPLANATIONS = {
     policy.SEARCH_REFUSED: "The search service answered with a challenge page instead of results (it declined automated "
                            "searches). This is not worked around: configure an approved search API (SEARCH_PROVIDER=serpapi) "
                            "or give the company website address / upload reports.",
+    policy.SEARCH_RATE_LIMITED: "The search service rate-limited this application (HTTP 429). Searches are paced and paused "
+                                "after a refusal; give the company website address, upload reports, or use an API provider.",
 }
 
 
@@ -223,6 +230,93 @@ def check_search() -> bool:
     return True
 
 
+SUSTAINED_QUERIES = ("sustainability report", "annual report", "ESG report", "climate target")
+
+
+def check_sustained_search() -> bool:
+    """A short sequence of queries, paced exactly as in an assessment: does the provider keep answering?"""
+    from app.services.search import providers as sp
+    from app.services.search.providers import get_search_provider
+
+    provider = get_search_provider()
+    if provider.name == "none":
+        return True
+    s = get_settings()
+    print(f"\nSustained search: {len(SUSTAINED_QUERIES)} queries, at least {s.search_min_interval_seconds:g}s apart "
+          f"(as in an assessment)")
+    if sp.pacer.cooldown_remaining() > 0:
+        _line("Result", f"paused: the provider declined searches {sp.pacer.cooldown_remaining():.0f}s ago or less")
+        return False
+    started = time.monotonic()
+    answered = 0
+    for n, q in enumerate(SUSTAINED_QUERIES, 1):
+        provider.search(q, max_results=3)
+        if provider.last_error:
+            kind = policy.search_failure_kind(provider.last_error)
+            _line("Result", f"query {n} FAILED ({provider.last_error}, {kind}) after {answered} answered")
+            print(f"  {EXPLANATIONS.get(provider.last_error, 'The search service stopped answering.')}")
+            if kind == "provider_restriction":
+                print("  Assessments stop searching at the first refusal and read the company's official website instead;")
+                print("  give the company website address so this works without search.")
+            return False
+        answered += 1
+    _line("Result", f"OK: {answered}/{len(SUSTAINED_QUERIES)} answered in {time.monotonic() - started:.1f}s")
+    return True
+
+
+def check_website_discovery(url: str) -> bool:
+    """Official-site discovery without search: homepage, robots.txt, sitemaps and the best candidate addresses.
+    Reads only those few files; no document is downloaded and nothing is stored."""
+    from app.services.documents.html_extractor import extract_html
+    from app.services.documents.url_safety import registrable_domain
+    from app.services.pipeline import site_discovery as sd
+    from app.services.security.safe_fetch import fetch
+
+    print(f"\nOfficial-site discovery: {url}")
+    try:
+        home = fetch(url, expect="html")
+    except SourceRejection as exc:
+        _line("Homepage", f"FAILED ({exc.code})")
+        print(f"  {EXPLANATIONS.get(exc.code, 'The site could not be read.')}")
+        return False
+    domain = registrable_domain(home.final_url) or ""
+    parts = urlsplit(home.final_url)
+    base = f"{parts.scheme}://{parts.netloc}/"
+    _line("Homepage", f"OK ({home.final_url})")
+    try:
+        rules = sd.parse_robots(fetch(base + "robots.txt", expect="text").content.decode("utf-8", "replace"), base)
+        _line("robots.txt", f"read; {len(rules.sitemaps)} sitemap(s) named")
+    except SourceRejection as exc:
+        rules = sd.SiteRules()
+        _line("robots.txt", f"not available ({exc.code}); no restrictions stated")
+    sitemap_urls: list[str] = []
+    queue = [u for u in rules.sitemaps if sd.on_site(u, domain)] or [base + "sitemap.xml"]
+    files = 0
+    while queue and files < get_settings().sitemap_max_files:
+        sm = queue.pop(0)
+        if sm.lower().endswith(".gz") or not rules.allows(sm):
+            continue
+        files += 1
+        try:
+            is_index, locs = sd.parse_sitemap(fetch(sm, expect="text").content.decode("utf-8", "replace"))
+        except SourceRejection as exc:
+            _line("Sitemap", f"{sm}: not available ({exc.code})")
+            continue
+        if is_index:
+            queue = sd.rank_sitemaps([u for u in locs if sd.on_site(u, domain)]) + queue
+        else:
+            sitemap_urls.extend(locs)
+    _line("Sitemaps", f"{files} file(s) read, {len(sitemap_urls)} address(es) listed")
+    ranked = sd.rank_site_urls(list(extract_html(home.content, home.final_url).links) + [(u, "") for u in sitemap_urls],
+                               domain, None)
+    allowed = [u for _, u in ranked if rules.allows(u)]
+    _line("Candidates", f"{len(allowed)} report/ESG/investor address(es) on {domain}"
+          + (f" ({len(ranked) - len(allowed)} excluded by robots.txt)" if len(ranked) > len(allowed) else ""))
+    for u in allowed[:5]:
+        print(f"    {u}")
+    return bool(allowed)
+
+
 def check_local_model() -> None:
     from app.services.llm.factory import get_llm_provider
 
@@ -237,25 +331,44 @@ def check_local_model() -> None:
 
 
 def main(argv: list[str]) -> int:
-    flags = {a for a in argv[1:] if a.startswith("--")}
-    args = [a for a in argv[1:] if not a.startswith("--")]
+    website = None
+    rest = list(argv[1:])
+    if "--website" in rest:
+        i = rest.index("--website")
+        website = rest[i + 1] if i + 1 < len(rest) else None
+        del rest[i:i + 2]
+    flags = {a for a in rest if a.startswith("--")}
+    args = [a for a in rest if not a.startswith("--")]
     url = args[0] if args else "https://www.example.com/"
     do_fetch, do_search = "--search-only" not in flags, "--retrieval-only" not in flags
     print("Swedbank ESG Compass - network check (no credentials are shown; nothing is stored)\n")
     check_configuration()
-    fetched = searched = None
+    fetched = searched = sustained = site = None
     if do_fetch:
         check_proxy_signin(check_route(url), url)
         fetched = check_fetch(url)
     if do_search:
         searched = check_search()
+        if searched:
+            sustained = check_sustained_search()
+    if website and do_fetch:
+        site = check_website_discovery(website)
     if do_fetch and do_search:
         check_local_model()
     print("\nSummary")
     if fetched is not None:
         _line("Website retrieval", "OK" if fetched else "FAILED")
     if searched is not None:
-        _line("Web search", "OK" if searched else "FAILED")
+        _line("Web search (one query)", "OK" if searched else "FAILED")
+    if sustained is not None:
+        _line("Web search (sustained)", "OK" if sustained else "LIMITED by the search service")
+    if site is not None:
+        _line("Official-site discovery", "OK" if site else "FAILED")
+    if sustained is False and searched:
+        print("\nOne search gets through, but the search service declines a sequence of searches (single-search")
+        print("connectivity works; sustained search-based discovery does not). Assessments then rely on the company's")
+        print("official website: enter its address on the New assessment page, or upload reports.")
+        return 1
     print()
     if fetched is not False and searched is not False:
         print("Automatic source discovery should work on this network." if do_fetch and do_search else

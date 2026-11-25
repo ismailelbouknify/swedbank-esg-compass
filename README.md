@@ -17,8 +17,11 @@ Deterministic Python rules map verified facts to levels, and every level is trac
 
 1. You enter a company name and assessment year (plus optionally a sustainability report PDF, website, country, industry).
 2. **Sources**: the uploaded PDF is the primary source. Without one, a controlled web search finds sustainability /
-   annual / ESG reports and a few official web pages (not a crawl). A given website is always read (homepage + a few
-   ESG-relevant links).
+   annual / ESG reports and a few official web pages (not a crawl). A given website is always read: homepage, a few
+   ESG-relevant links, then report, ESG, investor and archive pages and report PDFs found through the site's own
+   navigation and sitemaps (robots.txt respected, fixed limits). When search is unavailable or thin, the same is done
+   for the official domain the identity check settled. Search and website retrieval are independent: a search service
+   that declines automated searches stops searching only (see "Source coverage").
 3. **Documents** are extracted page-by-page (PyMuPDF), tables enriched with pdfplumber where useful, split into
    page-aware chunks.
 4. **Retrieval**: BM25 + factor/dimension keyword dictionaries select a few relevant passages per question; a cheap
@@ -131,6 +134,11 @@ All in `backend/.env` (see `backend/.env.example`):
 | `SEARCH_PROVIDER` | `ddgs` | `ddgs` (no key), `duckduckgo_lite` (no key, application transport), `serpapi` (+`SERPAPI_API_KEY`), `none` |
 | `MAX_SEARCH_RESULTS` | `10` | results downloaded from search |
 | `MAX_PAGES_PER_SITE` | `10` | HTML pages fetched per assessment |
+| `WEBSITE_DISCOVERY_ENABLED` | `true` | read the official site's navigation and sitemaps |
+| `WEBSITE_MAX_PAGES` / `WEBSITE_MAX_PDFS` | `8` / `3` | pages / report PDFs read in that stage |
+| `SITEMAP_MAX_FILES` | `3` | sitemap files read per site (an index counts as one) |
+| `SEARCH_MIN_INTERVAL_SECONDS` | `5` | pacing of keyless DuckDuckGo searches, process-wide |
+| `SEARCH_REFUSAL_COOLDOWN_SECONDS` | `900` | no searches for this long after the service declined |
 | `MAX_DOWNLOADED_PDFS` | `3` | PDFs downloaded per assessment |
 | `MAX_PDF_SIZE_MB` | `100` | upload limit (automatic retrieval: `MAX_DOWNLOAD_MB`, `100`) |
 | `MAX_PDF_PAGES` | `0` | page-count limit; `0` = none |
@@ -232,6 +240,21 @@ and the analyst is asked to upload a report). Coverage counts sources that pass 
 `COVERAGE_MIN_VALID_SOURCES` official sources that are about sustainability. Third-party pages never make coverage sufficient. When coverage is thin, one bounded recovery search runs (`RECOVERY_*` settings). Its sources pass
 through the same gates. Search queries contain the company name and search terms only. `recovery_search_enabled=false` turns it off.
 
+**Search refusals and the official website.** Keyless DuckDuckGo search has no published limit and answers a burst of
+queries with a challenge page: a single query may succeed (as in a diagnostic) while an assessment's sequence is
+declined. Searches are therefore paced (`SEARCH_MIN_INTERVAL_SECONDS`); at the first refusal or rate limit
+(`search_service_refused`, `search_service_rate_limited`) searching stops for that assessment and pauses for
+`SEARCH_REFUSAL_COOLDOWN_SECONDS`, and is never retried around the refusal. A search refusal does not stop website or
+PDF retrieval, which has its own failure count. The official website is then read directly: the address given on the
+New assessment page, or otherwise the domain the identity check settled (resolved, never ambiguous; a domain is never
+guessed). From its homepage, navigation links and sitemaps (robots.txt `Sitemap:` lines, else `/sitemap.xml`; index
+files followed to their most relevant children; `.gz` sitemaps skipped), the most relevant report, ESG, investor and
+archive pages and report PDFs are read within `WEBSITE_MAX_PAGES` / `WEBSITE_MAX_PDFS`, honouring robots.txt (an
+unavailable robots.txt with a server error means no exploration). Every document passes the same identity and evidence
+gates. The audit event `web_access_diagnostics` separates search failures by cause (`provider_restriction`,
+`corporate_network`, `connectivity`), and `official_site_explored` records what the site stage read. An API-based
+provider (`SEARCH_PROVIDER=serpapi`) remains available and optional.
+
 ### Security configuration
 
 `BANK_SAFE_MODE=true` (the default) is a restricted security mode: a security-hardened configuration intended to support
@@ -323,7 +346,10 @@ organisation set it up, and never works around it:
   `proxy_integrated_signin_refused`, ...), plus the PAC state and sign-in mode.
 - *Diagnostics.* On the computer where access fails, run `python -m app.network_check [url]` from `backend/`. It makes the
   application's own requests through the same settings and reports the route, the result and what to change. It stores
-  nothing and prints no credentials.
+  nothing and prints no credentials. Website retrieval, single-search connectivity (one query) and sustained search
+  (a short sequence paced as in an assessment) are reported separately, since a search service may answer one query
+  and decline the next; `--website https://www.company.com/` adds a dry run of official-site discovery (homepage,
+  robots.txt, sitemaps, best candidate addresses). `--retrieval-only` / `--search-only` check one component.
 
 When automatic access is refused, upload the company's report on the new-assessment page: the analysis uses it as the
 primary source. `ENABLE_WEB_SEARCH=false` and `ENABLE_EXTERNAL_FETCH=false` turn automatic access off entirely.

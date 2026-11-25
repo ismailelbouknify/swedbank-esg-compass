@@ -75,7 +75,8 @@ def build_client(proxy: str | None = None, proxy_headers: dict[str, str] | None 
 
 def fetch(url: str, *, expect: str = "any", client: httpx.Client | None = None, deadline: float | None = None,
           purpose: str = "retrieval") -> FetchResult:
-    """Retrieve one public PDF or HTML page into memory. `expect` is 'pdf', 'html' or 'any'.
+    """Retrieve one public PDF or HTML page into memory. `expect` is 'pdf', 'html', 'any', or 'text' for a small
+    text document such as robots.txt or a sitemap (never a PDF; HTML page size limit).
     `purpose='search'` is a search-results page: it is governed by ENABLE_WEB_SEARCH instead of ENABLE_EXTERNAL_FETCH,
     and goes through exactly the same proxy, sign-in, certificate, address and size checks.
     Raises FetchError, whose `code` says why; nothing is written to disk."""
@@ -273,7 +274,7 @@ def _read_body(resp: httpx.Response, url: str, current: str, expect: str, deadli
         raise FetchError(policy.INVALID_CONTENT_TYPE, f"Unexpected content type {content_type!r}")
 
     html_limit = min(settings.max_download_mb, settings.max_html_size_mb) * 1024 * 1024
-    limit = html_limit if declared == "html" else settings.max_download_mb * 1024 * 1024
+    limit = html_limit if declared == "html" or expect == "text" else settings.max_download_mb * 1024 * 1024
     declared_size = resp.headers.get("content-length", "")
     if declared_size.isdigit() and int(declared_size) > limit:
         raise FetchError(policy.DOWNLOAD_SIZE_LIMIT_EXCEEDED, f"Declared size {declared_size} exceeds {limit} bytes")
@@ -294,13 +295,15 @@ def _read_body(resp: httpx.Response, url: str, current: str, expect: str, deadli
     # The bytes decide what the document is, not the URL or a generic header: a ".pdf" link may land on an
     # HTML page, and download endpoints serve PDFs as octet-stream. A PDF needs its signature.
     kind = sniff_kind(content)
+    if expect == "text" and kind != "pdf" and declared != "pdf":
+        kind = "text"  # robots.txt and sitemaps: read as text only, never parsed as a document
     if declared == "html" and kind is None:
         kind = "html"  # HTML fragments without an <html> tag are still pages
     if declared == "pdf" and kind != "pdf":
         raise FetchError(policy.INVALID_PDF_SIGNATURE, "Content does not have a PDF signature")
     if kind is None or (expect != "any" and kind != expect):
         raise FetchError(policy.INVALID_CONTENT_TYPE, f"Unexpected content {content_type!r}")
-    if kind == "html" and len(content) > html_limit:
+    if kind in ("html", "text") and len(content) > html_limit:
         raise FetchError(policy.DOWNLOAD_SIZE_LIMIT_EXCEEDED, f"Page exceeds {html_limit} bytes")
     if kind == "html" and len(content) <= network.BLOCK_PAGE_SCAN_BYTES:
         refused = network.classify_block_page(resp.status_code, content)  # some filters answer 200 with their own page

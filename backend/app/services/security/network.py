@@ -365,6 +365,8 @@ def classify_search_error(exc: BaseException) -> str:
         return policy.TLS_VERIFICATION_FAILED
     if "proxy" in text:
         return policy.PROXY_CONNECTION_FAILED
+    if "ratelimit" in text or "rate limit" in text or "too many requests" in text or " 429" in text:
+        return policy.SEARCH_RATE_LIMITED
     if isinstance(exc, TimeoutError) or "timed out" in text or "timeout" in text:
         return policy.SOURCE_TIMEOUT
     return policy.NETWORK_ERROR

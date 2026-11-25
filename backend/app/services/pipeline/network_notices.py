@@ -25,10 +25,13 @@ SEARCH_SIGNIN_MESSAGE = ("The web search service could not be used because the n
                          "SEARCH_PROVIDER=ddgs or duckduckgo_lite, searches use the same Windows sign-in as page "
                          "retrieval; SerpAPI also supports it. Pages and documents are still read with integrated "
                          "sign-in. " + MANUAL_UPLOAD_HINT)
-SEARCH_REFUSED_MESSAGE = ("The search service declined automated searches from this application, so no public sources "
-                          "were found by search. This is the service's decision and is not worked around. A company "
-                          "website address and uploaded reports still work; an approved search service with an API "
-                          "key (SEARCH_PROVIDER=serpapi) can be configured instead.")
+SEARCH_REFUSED_MESSAGE = ("The search service limited automated searches from this application, so searching was "
+                          "paused for this analysis. This is the service's decision and is not worked around; website "
+                          "and document retrieval were not affected.")
+SITE_READ_SUFFIX = " The company's official website was read directly instead (its navigation and sitemaps)."
+WEBSITE_HINT = (" Enter the company website address on the New assessment page so that its official pages can be read "
+                "without search, or upload the company's report. An approved search service with an API key "
+                "(SEARCH_PROVIDER=serpapi) can also be configured.")
 WEB_FILTER_MESSAGE = ("The organisation's web filter blocked one or more websites, so they were not read. "
                       + MANUAL_UPLOAD_HINT)
 TLS_MESSAGE = ("Secure connections to websites could not be verified on this network. If the network inspects "
@@ -49,6 +52,8 @@ SEARCH_MESSAGE = ("The web search service could not be reached from this network
                   "automatically. " + MANUAL_UPLOAD_HINT)
 STOPPED_MESSAGE = ("Automatic web access was stopped for this analysis after repeated network failures, and the "
                    "analysis continued with the sources available.")
+SEARCH_STOPPED_MESSAGE = ("Web search was stopped for this analysis after repeated failures. Website and document "
+                          "retrieval continued separately.")
 SIZE_LIMIT_MESSAGE = ("A document was larger than the configured size limit (MAX_DOWNLOAD_MB) and was not read. "
                       + MANUAL_UPLOAD_HINT)
 PAGE_LIMIT_MESSAGE = ("A document had more pages than the configured limit (MAX_PDF_PAGES) and was not read. "
@@ -83,13 +88,16 @@ def network_notices(web: WebAccessState) -> list[str]:
             out.append(DIRECT_UNREACHABLE_MESSAGE + (PAC_HINT if network.windows_autoconfig_url() else ""))
         elif web.fetch_failures or unreachable > 1:
             out.append(CONNECTION_MESSAGE)
-    if web.search_issues[policy.SEARCH_REFUSED] and not web.search_successes:
-        out.append(SEARCH_REFUSED_MESSAGE)
+    if web.search_declined:
+        out.append(SEARCH_REFUSED_MESSAGE + (SITE_READ_SUFFIX if web.site_pages_read else WEBSITE_HINT))
     if web.search_issues and not web.search_successes and not any(
-            m in out for m in (PROXY_AUTH_MESSAGE, SEARCH_SIGNIN_MESSAGE, SEARCH_REFUSED_MESSAGE, DIRECT_UNREACHABLE_MESSAGE)):
+            m.startswith(prefix) for m in out
+            for prefix in (PROXY_AUTH_MESSAGE, SEARCH_SIGNIN_MESSAGE, SEARCH_REFUSED_MESSAGE, DIRECT_UNREACHABLE_MESSAGE)):
         out.append(SEARCH_MESSAGE)
-    if web.fetch_stopped or web.search_stopped:
+    if web.fetch_stopped:
         out.append(STOPPED_MESSAGE)
+    elif web.search_stopped and not web.search_declined:
+        out.append(SEARCH_STOPPED_MESSAGE)
     if web.issues[policy.DOWNLOAD_SIZE_LIMIT_EXCEEDED]:
         out.append(SIZE_LIMIT_MESSAGE)
     if web.issues[policy.PDF_PAGE_LIMIT_EXCEEDED]:
@@ -107,5 +115,20 @@ def network_audit_details(web: WebAccessState) -> dict:
         "search_successes": web.search_successes,
         "fetch_stopped": web.fetch_stopped,
         "search_stopped": web.search_stopped,
+        "search_declined_by_provider": web.search_declined,
+        "search_failure_kinds": dict(_kinds(web)),
         "searches_skipped": web.skipped_searches,
+        "official_sites_explored": sorted(d for d in web.sites_explored if d),
+        "official_site_sources_read": web.site_pages_read,
+        "robots_txt_skipped": web.robots_skipped,
     }
+
+
+def _kinds(web: WebAccessState):
+    """Search failures by cause: the provider's restrictions, the organisation's network, or connectivity."""
+    from collections import Counter
+
+    kinds: Counter = Counter()
+    for code, n in web.search_issues.items():
+        kinds[policy.search_failure_kind(code)] += n
+    return kinds

@@ -363,7 +363,9 @@ def test_assessment_with_refused_web_access_completes_quickly_with_a_clear_reaso
     assert st["status"] == "COMPLETED"
     assert len(search.queries) == 3, "searching stops after the failure limit, also in the recovery pass"
     assert len(requests) == 1, "only the company website was attempted"
-    assert notices.PROXY_AUTH_MESSAGE in st["notices"] and notices.STOPPED_MESSAGE in st["notices"]
+    assert notices.PROXY_AUTH_MESSAGE in st["notices"]
+    # search hit its failure limit; website retrieval was not stopped (it was refused once), so only search is named
+    assert notices.SEARCH_STOPPED_MESSAGE in st["notices"] and notices.STOPPED_MESSAGE not in st["notices"]
     assert any("bypass" in n for n in st["notices"])
     diag = next(e for e in _events(aid) if e.event_type == "web_access_diagnostics")
     assert diag.details["search_stopped"] is True and diag.details["fetch_issues"] == {policy.PROXY_AUTH_REQUIRED: 1}

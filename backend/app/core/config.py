@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     # ddgs | duckduckgo_lite | serpapi | none. ddgs switches to duckduckgo_lite (the application's own transport)
     # when the search route needs integrated proxy sign-in, which the DDGS client cannot perform.
     search_provider: str = "ddgs"
+    # Keyless DuckDuckGo searches (ddgs, duckduckgo_lite) are paced: at least this many seconds between queries, in
+    # the whole process. DuckDuckGo answers bursts with a challenge page; pacing respects that limit.
+    search_min_interval_seconds: float = 5.0
+    # After the search service declines or rate-limits automated searches, no search is sent for this long (process-
+    # wide); searching for that assessment stops at once, and official websites are still read.
+    search_refusal_cooldown_seconds: float = 900
     serpapi_api_key: str = ""
     max_search_results: int = 10
     max_pages_per_site: int = 10
@@ -79,6 +85,14 @@ class Settings(BaseSettings):
     # Stop automatic web access for the rest of an assessment after this many network-level failures in a row
     # with nothing ever succeeding (fetches and searches counted separately). 0 = never stop early.
     web_access_failure_limit: int = 3
+
+    # --- Official website discovery (navigation + sitemaps) ------------
+    # The company's own site: the website given in the assessment, or the official domain the identity check settled.
+    # Read without a search engine when search is unavailable or thin, within these limits; robots.txt is respected.
+    website_discovery_enabled: bool = True
+    website_max_pages: int = 8  # HTML pages read from navigation and sitemaps (besides the homepage)
+    website_max_pdfs: int = 3  # report PDFs read from the official site in this stage
+    sitemap_max_files: int = 3  # sitemap files read (an index counts as one)
 
     # --- Source coverage / recovery search -------------------------------
     coverage_min_valid_sources: int = 3

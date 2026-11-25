@@ -42,8 +42,11 @@ def _db():
 @pytest.fixture(autouse=True)
 def _no_host_proxy_settings(monkeypatch):
     """Tests never read this computer's Windows proxy settings (PAC / WPAD); tests that need them set them."""
+    from app.services.search import providers
     from app.services.security import network
 
+    providers.pacer.reset()  # no cool-down or pacing carried between tests, and no real waiting
+    monkeypatch.setattr(providers.pacer, "sleep", lambda _s: None)
     monkeypatch.setattr(network, "windows_config", lambda: None)
     monkeypatch.setattr(network, "windows_autoconfig_url", lambda: None)
     network.reset_pac_cache()

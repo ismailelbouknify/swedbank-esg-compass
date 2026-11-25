@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -26,6 +27,47 @@ DDG_LITE_URL = "https://lite.duckduckgo.com/lite/"
 DDGS_ROUTE_PROBE_URL = "https://duckduckgo.com/"
 # DuckDuckGo answers suspected automation with a challenge page instead of results; it is reported, never solved
 _CHALLENGE = re.compile(rb"anomaly|captcha|challenge-form|bots use duckduckgo", re.I)
+
+
+class SearchPacer:
+    """Process-wide pacing for the keyless DuckDuckGo providers, which have no published rate limit and answer bursts
+    of queries with a challenge page. Queries are spaced by SEARCH_MIN_INTERVAL_SECONDS, and after a refusal no query
+    is sent until SEARCH_REFUSAL_COOLDOWN_SECONDS have passed. This only ever slows the application down."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last = 0.0
+        self._declined_until = 0.0
+        self.sleep = time.sleep
+
+    def cooldown_remaining(self) -> float:
+        return max(0.0, self._declined_until - time.monotonic())
+
+    def wait_turn(self) -> None:
+        with self._lock:
+            gap = get_settings().search_min_interval_seconds - (time.monotonic() - self._last)
+            if gap > 0:
+                self.sleep(gap)
+            self._last = time.monotonic()
+
+    def declined(self) -> None:
+        self._declined_until = time.monotonic() + get_settings().search_refusal_cooldown_seconds
+
+    def reset(self) -> None:
+        self._last = self._declined_until = 0.0
+
+
+pacer = SearchPacer()
+
+
+def _cooling_down(provider: SearchProvider) -> bool:
+    """During the cool-down after a refusal, a search is answered as refused without sending anything."""
+    if pacer.cooldown_remaining() <= 0:
+        return False
+    provider.failed_searches += 1
+    provider.last_error = policy.SEARCH_REFUSED
+    log.info("search_skipped: provider=%s reason=cooldown remaining_s=%d", provider.name, pacer.cooldown_remaining())
+    return True
 
 
 def _result_url(href: str) -> str | None:
@@ -74,7 +116,10 @@ class DuckDuckGoLiteSearchProvider(SearchProvider):
         self._client = client  # tests only; a given client never signs in to a proxy
 
     def search(self, query: str, max_results: int) -> list[SearchResult]:
+        if _cooling_down(self):
+            return []
         url = f"{DDG_LITE_URL}?{urlencode({'q': query})}"
+        pacer.wait_turn()
         try:
             res = fetch(url, expect="html", client=self._client, purpose="search",
                         deadline=time.monotonic() + get_settings().search_timeout_seconds)
@@ -82,9 +127,14 @@ class DuckDuckGoLiteSearchProvider(SearchProvider):
             if not results and _CHALLENGE.search(res.content[:200_000]):
                 raise FetchError(policy.SEARCH_REFUSED, "The search service answered with a challenge page")
         except SourceRejection as exc:
+            code = exc.code
+            if code == policy.HTTP_ERROR and "429" in str(exc):
+                code = policy.SEARCH_RATE_LIMITED
+            if code in policy.SEARCH_PROVIDER_RESTRICTION_CODES:
+                pacer.declined()
             self.failed_searches += 1
-            self.last_error = exc.code
-            log.warning("search_failed: provider=%s reason=%s", self.name, exc.code)
+            self.last_error = code
+            log.warning("search_failed: provider=%s reason=%s kind=%s", self.name, code, policy.search_failure_kind(code))
             return []
         self.last_error = None
         return results[:max_results]
@@ -114,6 +164,9 @@ class DDGSSearchProvider(SearchProvider):
             self.last_error = self._approved.last_error
             return results
         self.transport = "ddgs"
+        if _cooling_down(self):
+            return []
+        pacer.wait_turn()
         try:
             try:
                 from ddgs import DDGS
@@ -131,7 +184,10 @@ class DDGSSearchProvider(SearchProvider):
         except Exception as exc:  # noqa: BLE001
             self.failed_searches += 1
             self.last_error = network.classify_search_error(exc)
-            log.warning("search_failed: provider=ddgs error=%s reason=%s", type(exc).__name__, self.last_error)
+            if self.last_error in policy.SEARCH_PROVIDER_RESTRICTION_CODES:
+                pacer.declined()
+            log.warning("search_failed: provider=ddgs error=%s reason=%s kind=%s", type(exc).__name__, self.last_error,
+                        policy.search_failure_kind(self.last_error))
             return []
         self.last_error = None
         return [

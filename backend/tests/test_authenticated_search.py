@@ -252,7 +252,7 @@ def test_refused_search_notice_is_plain_and_points_to_approved_options():
     web = WebAccessState()
     web.record_search(policy.SEARCH_REFUSED)
     out = notices.network_notices(web)
-    assert out == [notices.SEARCH_REFUSED_MESSAGE] and "not worked around" in out[0]
+    assert len(out) == 1 and out[0].startswith(notices.SEARCH_REFUSED_MESSAGE) and "not worked around" in out[0]
     assert analyst_notices(out) == out
 
 
@@ -272,6 +272,7 @@ def checks(monkeypatch):
     monkeypatch.setattr(network_check, "check_route", lambda url: ran.append("route"))
     monkeypatch.setattr(network_check, "check_proxy_signin", lambda proxy, url: ran.append("signin"))
     monkeypatch.setattr(network_check, "check_local_model", lambda: ran.append("model"))
+    monkeypatch.setattr(network_check, "check_sustained_search", lambda: ran.append("sustained") or True)
     results = {"fetch": True, "search": True}
 
     def fetch_check(url):
@@ -301,7 +302,7 @@ def test_network_check_reports_each_component_separately(checks, capsys):
     results["search"] = False
     assert network_check.main(["x"]) == 1
     out = capsys.readouterr().out
-    assert "Website retrieval          OK" in out and "Web search                 FAILED" in out
+    assert "Website retrieval          OK" in out and "Web search (one query)     FAILED" in out
     assert "Websites can be read, but search does not work" in out
 
 

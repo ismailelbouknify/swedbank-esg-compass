@@ -34,6 +34,9 @@ HTTP_ERROR = "http_error"
 PDF_PARSE_FAILED = "pdf_parse_failed"
 # The search service answered, but with a challenge or refusal page instead of results (not worked around)
 SEARCH_REFUSED = "search_service_refused"
+SEARCH_RATE_LIMITED = "search_service_rate_limited"  # HTTP 429 or the client's own rate-limit error
+# The search provider's own restrictions, as opposed to the organisation's network refusing the request
+SEARCH_PROVIDER_RESTRICTION_CODES = frozenset({SEARCH_REFUSED, SEARCH_RATE_LIMITED})
 # Network environment: the organisation's network, not this application, refused or could not carry the request
 PROXY_AUTH_REQUIRED = "proxy_authentication_required"
 PROXY_CONNECTION_FAILED = "proxy_connection_failed"
@@ -48,7 +51,8 @@ NETWORK_ENVIRONMENT_CODES = frozenset({PROXY_CONNECTION_FAILED, TLS_VERIFICATION
 # The request did not get through at all: what decides whether automatic web access is worth continuing
 CONNECTIVITY_FAILURE_CODES = frozenset({PROXY_CONNECTION_FAILED, TLS_VERIFICATION_FAILED,
                                         NETWORK_ERROR, DNS_RESOLUTION_FAILED, SOURCE_TIMEOUT}) | PROXY_SIGNIN_CODES
-AVAILABILITY_CODES = frozenset({DNS_RESOLUTION_FAILED, SOURCE_TIMEOUT, NETWORK_ERROR, HTTP_ERROR, PDF_PARSE_FAILED, SEARCH_REFUSED}) | NETWORK_ENVIRONMENT_CODES
+AVAILABILITY_CODES = frozenset({DNS_RESOLUTION_FAILED, SOURCE_TIMEOUT, NETWORK_ERROR, HTTP_ERROR, PDF_PARSE_FAILED, SEARCH_REFUSED,
+                                SEARCH_RATE_LIMITED}) | NETWORK_ENVIRONMENT_CODES
 
 # Audit event per code; a rejected redirect target is always logged as redirect_rejected.
 _AUDIT_EVENTS = {
@@ -82,6 +86,19 @@ class SourceRejection(ValueError):
         self.code = code
         self.retryable = retryable
         self.redirected = redirected
+
+
+def search_failure_kind(code: str | None) -> str:
+    """provider_restriction: the search service limited or declined automated searches.
+    corporate_network: the organisation's proxy, web filter or certificate inspection refused the request.
+    connectivity: no connection, name lookup or answer in time. other: anything else."""
+    if code in SEARCH_PROVIDER_RESTRICTION_CODES:
+        return "provider_restriction"
+    if code in NETWORK_ENVIRONMENT_CODES:
+        return "corporate_network"
+    if code in (NETWORK_ERROR, DNS_RESOLUTION_FAILED, SOURCE_TIMEOUT):
+        return "connectivity"
+    return "other"
 
 
 def is_security_rejection(code: str) -> bool:

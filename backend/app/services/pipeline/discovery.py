@@ -1,5 +1,9 @@
-"""Controlled public-web discovery: a few search queries + a few pages from the company site.
-Never crawls a whole site."""
+"""Controlled public-web discovery: a few search queries + a few pages from the company's official site.
+Never crawls a whole site.
+
+Search and website retrieval are independent: a search provider that declines automated searches stops searching
+only, and the official website (given by the analyst, or the domain the identity check settled) is still read
+through its navigation and sitemaps within fixed limits."""
 from __future__ import annotations
 
 import logging
@@ -17,10 +21,11 @@ from app.core.config import get_settings
 from app.models.entities import Assessment, Source
 from app.services.audit import log_event, log_source_rejection
 from app.services.company.identify import classify_source, looks_official, rank_search_result
-from app.services.company.resolution import AMBIGUOUS, UNVERIFIED, resolve_company
+from app.services.company.resolution import AMBIGUOUS, RESOLVED, UNVERIFIED, resolve_company
 from app.services.company.source_identity import _domain_labels
-from app.services.documents.html_extractor import extract_html, relevant_links
+from app.services.documents.html_extractor import HtmlContent, extract_html, relevant_links
 from app.services.documents.url_safety import registrable_domain
+from app.services.pipeline import site_discovery
 from app.services.pipeline.ingest import ingest_html, ingest_pdf
 from app.services.documents.pdf_extractor import peek_pdf
 from app.services.documents.report_kind import primary_report_kind
@@ -94,7 +99,10 @@ class WebAccessState:
     When nothing has ever got through and `limit` requests in a row have failed at network level (proxy refusal,
     certificate failure, no connection), more attempts would only add waiting time: automatic access stops and the
     assessment continues with what it has. Fetches and searches are judged separately: a search service can be
-    blocked while company websites are reachable. A web filter blocking one site says nothing about the next."""
+    blocked while company websites are reachable. A web filter blocking one site says nothing about the next.
+
+    A search provider that declines or rate-limits automated searches stops searching at once (also after earlier
+    successes): sending more queries would only disregard the provider's limit. Website retrieval is unaffected."""
     limit: int = 0
     fetch_failures: int = 0
     fetch_successes: int = 0
@@ -103,6 +111,10 @@ class WebAccessState:
     issues: Counter = field(default_factory=Counter)  # policy code -> count, fetches and candidate checks
     search_issues: Counter = field(default_factory=Counter)
     skipped_searches: int = 0
+    search_declined: bool = False  # the search provider limited or declined automated searches
+    sites_explored: set = field(default_factory=set)  # official domains whose navigation and sitemaps were read
+    site_pages_read: int = 0  # sources read in the official-website stage
+    robots_skipped: int = 0  # addresses not read because the site's robots.txt asks automated clients not to
 
     def record_fetch(self, code: str | None) -> None:
         """One fetch outcome: None when the site answered with usable content."""
@@ -125,6 +137,8 @@ class WebAccessState:
         else:
             self.search_issues[code] += 1
             self.search_failures += 1
+            if code in policy.SEARCH_PROVIDER_RESTRICTION_CODES:
+                self.search_declined = True
 
     @property
     def fetch_stopped(self) -> bool:
@@ -132,7 +146,12 @@ class WebAccessState:
 
     @property
     def search_stopped(self) -> bool:
-        return self.limit > 0 and not self.search_successes and self.search_failures >= self.limit
+        return self.search_declined or (self.limit > 0 and not self.search_successes and self.search_failures >= self.limit)
+
+    @property
+    def search_unavailable(self) -> bool:
+        """Search gave nothing usable: stopped, declined, or every attempt failed."""
+        return self.search_stopped or (bool(self.search_issues) and not self.search_successes)
 
 
 @dataclass
@@ -459,64 +478,13 @@ def discover(db: Session, a: Assessment, provider: SearchProvider, do_search: bo
     run = _Pass(db, a, report, progress, _SeenUrls(s.url for s in a.sources if s.url), settings.max_downloaded_pdfs,
                 settings.max_pages_per_site, settings.max_search_results)
 
-    # 1) official website (if provided): homepage + a few ESG-relevant links
+    # 1) official website (if provided): homepage + a few ESG-relevant links, then its navigation and sitemaps
     if company.website and settings.enable_external_fetch:
-        try:
-            progress(f"Reading company website {company.website}")
-            db.commit()
-            fetch_started = time.monotonic()
-            try:
-                home = fetch(company.website, expect="html")
-            except SourceRejection as exc:
-                report.web.record_fetch(exc.code)
-                raise
-            finally:
-                report.fetch_seconds += time.monotonic() - fetch_started
-            report.web.record_fetch(None)
-            content = extract_html(home.content, home.final_url)
-            report.official_domain = company.domain = registrable_domain(home.final_url) or company.domain
-            s = _new_source(db, a, home.final_url, content.title or company.name, "company_website", True, "company website")
-            run.seen_urls.add(home.final_url)
-            s.content_type, s.content_sha256, s.bytes_downloaded, s.fetch_outcome = home.content_type, home.sha256, home.size, "ok"
-            ingest_html(db, s, home.content, home.final_url)
-            report.sources_processed += s.status == "PROCESSED" and apply_source_identity(db, a, s)
-            run.html_budget -= 1
-            # Follow links to primary report PDFs found on the homepage.
-            run.follow_report_links(content, home.final_url, "company website homepage")
-            for link in relevant_links(content, report.official_domain, limit=settings.max_pages_per_site):
-                if report.web.fetch_stopped:
-                    break
-                if link in run.seen_urls or run.html_budget <= 0:
-                    continue
-                is_pdf = link.lower().split("?")[0].endswith(".pdf")
-                if is_pdf and run.pdf_budget <= 0:
-                    continue
-                run.seen_urls.add(link)
-                if not _admit(db, a, link, report):
-                    continue
-                stype, official = classify_source(link, "", "", company.name, report.official_domain)
-                s = _new_source(db, a, link, link.rsplit("/", 1)[-1] or link, stype, official, "link on company website")
-                progress(f"Downloading {link}")
-                res = _download_into(db, s, report)
-                if s.rejection_reason:
-                    continue  # a wrong-company document does not use up the budget
-                if is_pdf:
-                    run.pdf_budget -= 1
-                else:
-                    run.html_budget -= 1
-                    # After downloading a sub-page, also check it for report PDF links.
-                    if res is not None and res.kind == "html":
-                        run.follow_report_links(extract_html(res.content, res.final_url), res.final_url, "company website sub-page")
-        except SourceRejection as exc:
-            report.warnings.append(f"Company website could not be fetched: {exc.code}")
-            report.sources_rejected += policy.is_security_rejection(exc.code)
-            report.sources_unavailable += not policy.is_security_rejection(exc.code)
-            log_source_rejection(db, exc, assessment_id=a.id, url=company.website, stage="company_website")
-        except SQLAlchemyError:
-            raise
-        except Exception as exc:  # noqa: BLE001 — malformed untrusted content must not stop the assessment
-            report.warnings.append(f"Company website could not be fetched: {type(exc).__name__}")
-            report.sources_unavailable += 1
+        home = _read_company_website(run, company.website, "company website")
+        if home is not None:
+            _explore_official_site(run, *home)
+        else:  # the analyst's address was tried: its domain is not tried again under other addresses
+            report.web.sites_explored.add((report.official_domain or registrable_domain(company.website) or "").lower())
 
     if not do_search or not settings.enable_web_search or not settings.enable_external_fetch:
         _resolve_identity(a, report, [])
@@ -526,11 +494,231 @@ def discover(db: Session, a: Assessment, provider: SearchProvider, do_search: bo
     # providers receive these queries (company name and search terms), never document content
     results = _run_searches(provider, build_queries(company.name, a.year), report, progress)
     _resolve_identity(a, report, results)
-    if not results:
+    if results:
+        run.take_results(results)
+    elif not report.web.search_unavailable:
         report.warnings.append(f"Web search ({provider.name}) returned no results.")
-        return report
-    run.take_results(results)
+    # 3) search unavailable or thin: the official site itself, when the identity check has settled which one it is
+    if report.web.search_unavailable or report.sources_processed < settings.coverage_min_valid_sources:
+        explore_validated_official_site(run)
     return report
+
+
+def validated_official_domain(a: Assessment, report: DiscoveryReport) -> str | None:
+    """The company's own domain, only when it is known for certain: given by the analyst, or settled by the identity
+    check (resolved, not ambiguous). A guess from search results is never enough to read a site as official."""
+    if a.company.website:
+        return report.official_domain or registrable_domain(a.company.website)
+    profile = a.company_identity or {}
+    if profile.get("status") == RESOLVED and profile.get("official_domain"):
+        return str(profile["official_domain"]).lower()
+    return None
+
+
+def explore_validated_official_site(run: "_Pass") -> None:
+    """Read the official site without search: homepage (if not read yet), then navigation and sitemaps."""
+    settings = get_settings()
+    report = run.report
+    domain = validated_official_domain(run.a, report)
+    if (not domain or not settings.website_discovery_enabled or not settings.enable_external_fetch
+            or domain in report.web.sites_explored or report.web.fetch_stopped):
+        return
+    for start in site_discovery.official_start_urls(domain):
+        if start in run.seen_urls:  # already read as a source (e.g. a search result): only its navigation is needed
+            home = _fetch_navigation(run, start)
+        else:
+            home = _read_company_website(run, start, "official domain (identity check)", quiet=True)
+        if home is not None:
+            _explore_official_site(run, *home)
+            return
+    report.web.sites_explored.add(domain)  # unreachable: not tried again in this assessment
+    report.warnings.append("Company website could not be fetched: official_domain_unreachable")
+
+
+def _read_company_website(run: "_Pass", url: str, via: str, quiet: bool = False) -> tuple[FetchResult, HtmlContent] | None:
+    """The homepage plus a few ESG-relevant links on it. Returns the homepage, or None when it could not be read."""
+    db, a, report, progress = run.db, run.a, run.report, run.progress
+    settings = get_settings()
+    company = a.company
+    if url in run.seen_urls:
+        return None
+    try:
+        progress(f"Reading company website {url}")
+        db.commit()
+        fetch_started = time.monotonic()
+        try:
+            home = fetch(url, expect="html")
+        except SourceRejection as exc:
+            report.web.record_fetch(exc.code)
+            raise
+        finally:
+            report.fetch_seconds += time.monotonic() - fetch_started
+        report.web.record_fetch(None)
+        content = extract_html(home.content, home.final_url)
+        report.official_domain = company.domain = registrable_domain(home.final_url) or company.domain
+        s = _new_source(db, a, home.final_url, content.title or company.name, "company_website", True, via)
+        run.seen_urls.add(url)
+        run.seen_urls.add(home.final_url)
+        s.content_type, s.content_sha256, s.bytes_downloaded, s.fetch_outcome = home.content_type, home.sha256, home.size, "ok"
+        ingest_html(db, s, home.content, home.final_url)
+        report.sources_processed += s.status == "PROCESSED" and apply_source_identity(db, a, s)
+        if s.rejection_reason:
+            db.commit()
+            return None  # not this company's site: nothing on it is followed
+        run.html_budget -= 1
+        # Follow links to primary report PDFs found on the homepage.
+        run.follow_report_links(content, home.final_url, "company website homepage")
+        for link in relevant_links(content, report.official_domain, limit=settings.max_pages_per_site):
+            if report.web.fetch_stopped:
+                break
+            if link in run.seen_urls or run.html_budget <= 0:
+                continue
+            is_pdf = link.lower().split("?")[0].endswith(".pdf")
+            if is_pdf and run.pdf_budget <= 0:
+                continue
+            run.seen_urls.add(link)
+            if not _admit(db, a, link, report):
+                continue
+            stype, official = classify_source(link, "", "", company.name, report.official_domain)
+            s = _new_source(db, a, link, link.rsplit("/", 1)[-1] or link, stype, official, "link on company website")
+            progress(f"Downloading {link}")
+            res = _download_into(db, s, report)
+            if s.rejection_reason:
+                continue  # a wrong-company document does not use up the budget
+            if is_pdf:
+                run.pdf_budget -= 1
+            else:
+                run.html_budget -= 1
+                # After downloading a sub-page, also check it for report PDF links.
+                if res is not None and res.kind == "html":
+                    run.follow_report_links(extract_html(res.content, res.final_url), res.final_url, "company website sub-page")
+        db.commit()
+        return home, content
+    except SourceRejection as exc:
+        if not quiet:
+            report.warnings.append(f"Company website could not be fetched: {exc.code}")
+        report.sources_rejected += policy.is_security_rejection(exc.code)
+        report.sources_unavailable += not policy.is_security_rejection(exc.code)
+        log_source_rejection(db, exc, assessment_id=a.id, url=url, stage="company_website")
+    except SQLAlchemyError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — malformed untrusted content must not stop the assessment
+        if not quiet:
+            report.warnings.append(f"Company website could not be fetched: {type(exc).__name__}")
+        report.sources_unavailable += 1
+    return None
+
+
+def _fetch_navigation(run: "_Pass", url: str) -> tuple[FetchResult, HtmlContent] | None:
+    """A page already recorded as a source, read again only for its links; no second source is created."""
+    run.db.commit()
+    try:
+        res = fetch(url, expect="html")
+    except SourceRejection as exc:
+        run.report.web.record_fetch(exc.code)
+        return None
+    run.report.web.record_fetch(None)
+    return res, extract_html(res.content, res.final_url)
+
+
+def _fetch_site_text(run: "_Pass", url: str) -> tuple[str | None, str]:
+    """robots.txt or a sitemap: (text or None, outcome code)."""
+    run.db.commit()
+    try:
+        res = fetch(url, expect="text")
+    except SourceRejection as exc:
+        run.report.web.record_fetch(exc.code)
+        return None, f"{exc.code}:{str(exc)[:12]}"
+    run.report.web.record_fetch(None)
+    return res.content.decode("utf-8", errors="replace"), "ok"
+
+
+def _read_robots(run: "_Pass", base: str) -> site_discovery.SiteRules | None:
+    """The site's robots.txt rules; None when the site asks automated clients to keep out for now (server error)."""
+    text, outcome = _fetch_site_text(run, base + "robots.txt")
+    if text is not None:
+        return site_discovery.parse_robots(text, base)
+    if outcome.startswith(policy.HTTP_ERROR) and "HTTP 5" in outcome:
+        return None  # RFC 9309: an unreachable robots.txt (5xx) means "do not crawl" for now
+    return site_discovery.SiteRules()  # none published (404 and similar): no restrictions stated
+
+
+def _sitemap_urls(run: "_Pass", base: str, rules: site_discovery.SiteRules, domain: str) -> tuple[list[str], int]:
+    """Addresses listed in the site's sitemaps (robots.txt Sitemap: lines, else /sitemap.xml): at most
+    SITEMAP_MAX_FILES files, index files followed to their most relevant children. Returns (urls, files read)."""
+    queue = [u for u in rules.sitemaps if site_discovery.on_site(u, domain)] or [base + "sitemap.xml"]
+    seen: set[str] = set()
+    urls: list[str] = []
+    files = 0
+    while queue and files < get_settings().sitemap_max_files and not run.out_of_time():
+        url = queue.pop(0)
+        if url in seen or url.lower().split("?")[0].endswith(".gz") or not rules.allows(url):
+            continue
+        seen.add(url)
+        text, _ = _fetch_site_text(run, url)
+        files += 1
+        if text is None:
+            continue
+        is_index, locs = site_discovery.parse_sitemap(text)
+        if is_index:
+            queue = site_discovery.rank_sitemaps([u for u in locs if site_discovery.on_site(u, domain)]) + queue
+        else:
+            urls.extend(locs[: site_discovery.MAX_SITEMAP_LOCS - len(urls)])
+    return urls, files
+
+
+def _explore_official_site(run: "_Pass", home: FetchResult, content: HtmlContent) -> None:
+    """Report, ESG, investor and archive pages and report PDFs found through the site's own navigation and sitemaps,
+    best first, within WEBSITE_MAX_PAGES / WEBSITE_MAX_PDFS. robots.txt is respected; every document passes the same
+    identity and evidence gates as any other source."""
+    settings = get_settings()
+    db, a, report = run.db, run.a, run.report
+    domain = (registrable_domain(home.final_url) or report.official_domain or "").lower()
+    if not settings.website_discovery_enabled or not domain or domain in report.web.sites_explored:
+        return
+    report.web.sites_explored.add(domain)
+    parts = urlparse(home.final_url)
+    base = f"{parts.scheme}://{parts.netloc}/"
+    run.progress(f"Reading the official website's navigation and sitemaps ({parts.netloc})")
+    rules = _read_robots(run, base)
+    if rules is None:
+        log_event(db, "official_site_explored", assessment_id=a.id, details={"domain": domain, "robots": "temporarily_unavailable"})
+        return
+    sitemap_urls, sitemap_files = _sitemap_urls(run, base, rules, domain)
+    ranked = site_discovery.rank_site_urls(list(content.links) + [(u, "") for u in sitemap_urls], domain, a.year)
+    stage = _Pass(db, a, report, run.progress, run.seen_urls, settings.website_max_pdfs, settings.website_max_pages,
+                  settings.website_max_pages + settings.website_max_pdfs, run.deadline)
+    read = 0
+    for _, url in ranked:
+        if stage.out_of_time() or (stage.pdf_budget <= 0 and stage.html_budget <= 0):
+            break
+        is_pdf = url.lower().split("?")[0].endswith(".pdf")
+        if url in stage.seen_urls or (stage.pdf_budget if is_pdf else stage.html_budget) <= 0:
+            continue
+        if not rules.allows(url):
+            report.web.robots_skipped += 1
+            continue
+        stage.seen_urls.add(url)
+        if not _admit(db, a, url, report):
+            continue
+        stype, official = classify_source(url, "", "", a.company.name, domain)
+        s = _new_source(db, a, url, url.rstrip("/").rsplit("/", 1)[-1] or url, stype, official, "official website (navigation/sitemap)")
+        run.progress(f"Downloading {url}")
+        res = _download_into(db, s, report)
+        if s.rejection_reason:
+            continue  # a wrong-company document does not use up the budget
+        read += 1
+        if is_pdf:
+            stage.pdf_budget -= 1
+        else:
+            stage.html_budget -= 1
+            if res is not None and res.kind == "html":
+                stage.follow_report_links(extract_html(res.content, res.final_url), res.final_url, "official website page")
+    report.web.site_pages_read += read
+    log_event(db, "official_site_explored", assessment_id=a.id,
+              details={"domain": domain, "sitemap_files": sitemap_files, "sitemap_urls": len(sitemap_urls),
+                       "candidates": len(ranked), "sources_read": read, "robots_skipped": report.web.robots_skipped})
+    db.commit()
 
 
 def recover_sources(db: Session, a: Assessment, provider: SearchProvider, earlier_queries: list[str],
@@ -551,9 +739,12 @@ def recover_sources(db: Session, a: Assessment, provider: SearchProvider, earlie
     queries = _interleave_queries(targeted, general, limit)
     results = _run_searches(provider, queries, report, progress, pause=settings.recovery_search_pause_seconds, deadline=deadline)
     _resolve_identity(a, report, results, may_choose_entity=False)
+    run = _Pass(db, a, report, progress, _SeenUrls(s.url for s in a.sources if s.url), settings.recovery_max_pdfs,
+                settings.recovery_max_pages, settings.recovery_max_pages + settings.recovery_max_pdfs, deadline)
     if results:
-        _Pass(db, a, report, progress, _SeenUrls(s.url for s in a.sources if s.url), settings.recovery_max_pdfs, settings.recovery_max_pages,
-              settings.recovery_max_pages + settings.recovery_max_pdfs, deadline).take_results(results)
+        run.take_results(results)
+    if report.web.search_unavailable:  # search cannot help: the official site still can, if not read already
+        explore_validated_official_site(run)
     db.commit()
     return report
 
