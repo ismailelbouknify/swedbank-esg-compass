@@ -39,6 +39,20 @@ def _db():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _no_host_proxy_settings(monkeypatch):
+    """Tests never read this computer's Windows proxy settings (PAC / WPAD); tests that need them set them."""
+    from app.services.security import network
+
+    monkeypatch.setattr(network, "windows_config", lambda: None)
+    monkeypatch.setattr(network, "windows_autoconfig_url", lambda: None)
+    network.reset_pac_cache()
+    network.reset_signin_state()
+    yield
+    network.reset_pac_cache()
+    network.reset_signin_state()
+
+
 @pytest.fixture()
 def client():
     from fastapi.testclient import TestClient

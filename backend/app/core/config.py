@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     # explicit: WEB_PROXY_URL | none: direct connections only
     web_proxy_mode: str = "system"
     web_proxy_url: str = ""  # explicit mode; may hold IT-issued proxy credentials, which are never logged
+    # system mode on Windows: the PAC script / WPAD auto-detection is evaluated by Windows itself (WinHTTP).
+    # Set this to evaluate a different PAC script than the one in Internet Options (e.g. when running as a service).
+    web_proxy_pac_url: str = ""
+    # none: no proxy sign-in. integrated: when the proxy asks for sign-in (407), use a Kerberos ticket from the
+    # signed-in Windows user's session (SSPI). No credentials are read or stored; NTLM is never used.
+    web_proxy_auth: str = "none"
     use_system_trust_store: bool = True  # trust the certificate authorities installed in the operating system
     web_ca_bundle: str = ""  # PEM file with the organisation's certificate authorities (takes precedence)
     # Stop automatic web access for the rest of an assessment after this many network-level failures in a row

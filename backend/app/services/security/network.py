@@ -5,13 +5,14 @@ Nothing here weakens a check or works around a control:
 - Certificates are always verified. The only choice is which trusted authorities are used: the organisation's
   bundle (WEB_CA_BUNDLE), else the operating system's store (so an authority deployed by IT is trusted the way
   the browser trusts it), else the certifi bundle.
-- Only a proxy the user or IT already configured is used. The application does not perform Windows integrated
-  (NTLM/Kerberos) proxy sign-in, never supplies credentials of its own and never routes around a proxy or filter.
-  When the network refuses a request, that is reported, and the analyst can upload the report instead.
+- Only a proxy the user or IT already configured is used, and never routed around. When the network refuses a
+  request, that is reported, and the analyst can upload the report instead.
+- Integrated proxy sign-in (WEB_PROXY_AUTH=integrated, off by default) uses a Kerberos ticket from the signed-in
+  Windows user's session, only when the proxy asks for sign-in. No credentials are read or stored; NTLM is not used.
 
 WEB_PROXY_MODE
-  system    (default) HTTPS_PROXY / HTTP_PROXY / NO_PROXY, otherwise the Windows Internet Options proxy.
-            Automatic configuration scripts (PAC/WPAD) are not evaluated: set WEB_PROXY_URL instead.
+  system    (default) HTTPS_PROXY / HTTP_PROXY / NO_PROXY; otherwise Windows Internet Options: the automatic
+            configuration script (PAC, or WPAD auto-detection) evaluated by Windows itself, then the static proxy.
   explicit  WEB_PROXY_URL for every request.
   none      direct connections only.
 """
@@ -24,10 +25,13 @@ from functools import lru_cache
 from urllib.parse import urlsplit
 
 from app.core.config import get_settings
-from app.services.security import policy
+from app.services.security import policy, windows_proxy
 from app.services.security.policy import run_bounded
 
 PROXY_MODES = ("system", "explicit", "none")
+PROXY_AUTH_MODES = ("none", "integrated")
+_pac_cache = windows_proxy.PacCache()
+_pac_state: dict[str, str] = {"last_error": "", "last_proxy": ""}
 SUPPORTED_PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
 BLOCK_PAGE_SCAN_BYTES = 64 * 1024
 
@@ -63,19 +67,150 @@ def _system_bypass(host: str) -> bool:
         return False
 
 
+def _environment_proxies() -> dict[str, str]:
+    try:
+        return urllib.request.getproxies_environment()
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def proxy_auth_mode() -> str:
+    mode = (get_settings().web_proxy_auth or "none").strip().lower()
+    return mode if mode in PROXY_AUTH_MODES else "none"
+
+
+def windows_config() -> windows_proxy.WindowsProxyConfig | None:
+    try:
+        return windows_proxy.read_windows_config()
+    except Exception:  # noqa: BLE001 — an unreadable setting means none, never a crash
+        return None
+
+
+def pac_configuration() -> tuple[str | None, bool]:
+    """(PAC script address, WPAD auto-detection) that system mode evaluates; (None, False) when there is none.
+    WEB_PROXY_PAC_URL replaces the Windows setting, e.g. for a service account without the user's settings."""
+    if proxy_mode() != "system" or _environment_proxies():
+        return None, False
+    explicit = get_settings().web_proxy_pac_url.strip()
+    if explicit:
+        return explicit, False
+    cfg = windows_config()
+    if cfg is None:
+        return None, False
+    return cfg.pac_url, cfg.auto_detect
+
+
+def pac_route(url: str) -> windows_proxy.PacResult | None:
+    """What the automatic proxy configuration says for `url`, or None when there is none to evaluate."""
+    pac_url, auto_detect = pac_configuration()
+    if not pac_url and not auto_detect:
+        return None
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    key = (pac_url, auto_detect, parts.scheme.lower(), (parts.hostname or "").lower())
+    cached = _pac_cache.get(key)
+    if cached is not None:
+        return cached
+    timeout = get_settings().http_connect_timeout_seconds
+    try:
+        result = run_bounded(lambda: windows_proxy.evaluate_pac(url, pac_url=pac_url, auto_detect=auto_detect,
+                                                                timeout_seconds=timeout), timeout + 5)
+    except Exception as exc:  # noqa: BLE001
+        result = windows_proxy.PacResult(False, error=f"evaluation did not finish ({type(exc).__name__})")
+    _pac_cache.put(key, result)
+    if result.ok:
+        _pac_state["last_error"] = ""
+        _pac_state["last_proxy"] = result.proxies[0] if result.proxies else "DIRECT"
+    elif not result.not_found:
+        _pac_state["last_error"] = result.error
+    return result
+
+
+def pac_status() -> dict[str, str]:
+    """What the automatic configuration is and what it last answered; proxy addresses masked like any other."""
+    pac_url, auto_detect = pac_configuration()
+    last = _pac_state["last_proxy"]
+    shown = "not evaluated" if not last else last if last == "DIRECT" else mask_proxy("http://" + last)
+    return {"pac": "script" if pac_url else "auto_detect" if auto_detect else "none",
+            "pac_last_result": shown, "pac_last_error": _pac_state["last_error"] or "none"}
+
+
+_signin_state: dict[str, str] = {"last_problem": ""}
+_signin_proxies: set[str] = set()  # proxies that asked for sign-in in this process: later connections sign in at once
+
+
+def integrated_signin_enabled(proxy: str | None) -> bool:
+    if not proxy or proxy_auth_mode() != "integrated":
+        return False
+    try:
+        return urlsplit(proxy).scheme.lower() in ("http", "https") and bool(urlsplit(proxy).hostname)
+    except ValueError:
+        return False
+
+
+def proxy_signin_header(proxy: str) -> dict[str, str]:
+    """A fresh `Proxy-Authorization: Negotiate <Kerberos ticket>` for one connection to `proxy`, from the signed-in
+    Windows user's session. Raises windows_proxy.IntegratedAuthUnavailable. Never logged."""
+    host = urlsplit(proxy).hostname or ""
+    try:
+        token = run_bounded(lambda: windows_proxy.kerberos_proxy_token(host), get_settings().http_connect_timeout_seconds)
+    except windows_proxy.IntegratedAuthUnavailable as exc:
+        note_signin_problem(exc.reason)
+        raise
+    except Exception as exc:  # noqa: BLE001 — e.g. no domain controller answered in time
+        note_signin_problem(f"no Kerberos ticket could be obtained ({type(exc).__name__})")
+        raise windows_proxy.IntegratedAuthUnavailable(_signin_state["last_problem"]) from exc
+    return {"Proxy-Authorization": f"Negotiate {token}"}
+
+
+def note_signin_problem(reason: str) -> None:
+    _signin_state["last_problem"] = reason
+
+
+def last_signin_problem() -> str:
+    return _signin_state["last_problem"]
+
+
+def remember_signin_required(proxy: str) -> None:
+    _signin_proxies.add(proxy)
+
+
+def signin_known_required(proxy: str) -> bool:
+    return proxy in _signin_proxies
+
+
+def reset_signin_state() -> None:
+    _signin_proxies.clear()
+    _signin_state["last_problem"] = ""
+
+
+def pac_failed() -> bool:
+    return bool(_pac_state["last_error"])
+
+
+def reset_pac_cache() -> None:
+    _pac_cache.clear()
+    _pac_state.update(last_error="", last_proxy="")
+
+
 def proxy_source() -> str:
-    """Where the proxy setting comes from: explicit | environment | windows_settings | none."""
+    """Where the proxy setting comes from: explicit | environment | windows_pac | windows_settings |
+    windows_auto_detect | none."""
     mode = proxy_mode()
     if mode == "none":
         return "none"
     if mode == "explicit":
         return "explicit" if get_settings().web_proxy_url.strip() else "none"
-    try:
-        if urllib.request.getproxies_environment():
-            return "environment"
-    except Exception:  # noqa: BLE001
-        pass
-    return "windows_settings" if _system_proxies() else "none"
+    if _environment_proxies():
+        return "environment"
+    pac_url, auto_detect = pac_configuration()
+    if pac_url:
+        return "windows_pac"
+    if _system_proxies():
+        return "windows_settings"
+    return "windows_auto_detect" if auto_detect else "none"
 
 
 def configured_proxy(scheme: str = "https") -> str | None:
@@ -95,6 +230,10 @@ def proxy_for(url: str) -> str | None:
         parts = urlsplit(url)
     except ValueError:
         return None
+    route = pac_route(url)
+    if route is not None and route.ok:  # the script decides, including DIRECT; its own exceptions are part of it
+        return f"http://{route.proxies[0]}" if route.proxies else None
+    # no script, or it could not be evaluated: the static setting applies, as it does for Windows itself
     proxy = configured_proxy(parts.scheme.lower() or "https")
     if not proxy or not is_supported_proxy(proxy):
         return None
@@ -213,9 +352,13 @@ def classify_block_page(status: int, body: bytes) -> str | None:
 
 def classify_search_error(exc: BaseException) -> str:
     """Search clients raise their own exception types; their text says what the network did."""
+    if isinstance(exc, windows_proxy.IntegratedAuthUnavailable):
+        return policy.PROXY_SIGNIN_UNAVAILABLE
     if is_certificate_failure(exc):
         return policy.TLS_VERIFICATION_FAILED
     text = f"{type(exc).__name__} {exc}".lower()
+    if "integrated sign-in refused" in text:
+        return policy.PROXY_SIGNIN_REFUSED
     if "407" in text or "proxy authentication" in text or "authentication_failed" in text:
         return policy.PROXY_AUTH_REQUIRED
     if "certificate" in text:
@@ -235,5 +378,7 @@ def describe() -> dict[str, str]:
         "https_proxy": mask_proxy(configured_proxy("https")),
         "http_proxy": mask_proxy(configured_proxy("http")),
         "pac_script_configured": "yes" if windows_autoconfig_url() else "no",
+        **pac_status(),
+        "proxy_auth": proxy_auth_mode(),
         "certificates": trust_source(),
     }

@@ -258,7 +258,7 @@ Search (if enabled) -> URL + DNS/IP check (no local/private targets) -> bounded 
 | Manual upload only | No search and no retrieval requests are made; analyses use uploaded PDFs | `ENABLE_WEB_SEARCH=false`, `ENABLE_EXTERNAL_FETCH=false` |
 | URL policy | HTTP and HTTPS to any public host; no credentials, non-standard ports, local names or numeric host tricks | |
 | Network targets | Every address a host resolves to must be public (private, loopback, link-local, metadata, multicast and reserved ranges are refused, for IPv4, IPv6 and IPv4 embedded in IPv6). A direct connection is pinned to the validated address; through a configured proxy, see "Managed networks" below | |
-| Proxy and certificates | Only an already-configured proxy is used (environment variables or Windows settings, or an explicit setting). Certificates are always verified, against the organisation's bundle or the operating-system store | `WEB_PROXY_MODE`, `WEB_PROXY_URL`, `USE_SYSTEM_TRUST_STORE`, `WEB_CA_BUNDLE` |
+| Proxy and certificates | Only an already-configured proxy is used (environment variables, Windows settings including the PAC script / WPAD as Windows evaluates it, or an explicit setting). Optional Kerberos sign-in from the Windows session, no stored credentials. Certificates are always verified, against the organisation's bundle or the operating-system store | `WEB_PROXY_MODE`, `WEB_PROXY_URL`, `WEB_PROXY_PAC_URL`, `WEB_PROXY_AUTH`, `USE_SYSTEM_TRUST_STORE`, `WEB_CA_BUNDLE` |
 | Early stop | After repeated network-level failures with nothing getting through, automatic access stops for that assessment and the reason is shown | `WEB_ACCESS_FAILURE_LIMIT`, `SEARCH_TIMEOUT_SECONDS` |
 | Redirects | Up to 10 (the hop cap also ends redirect loops), to any public host (e.g. corporate site to CDN); each target is checked like a new URL, so a redirect cannot reach a local or internal address. Cookies last for one redirect chain | `MAX_REDIRECTS` |
 | Size and pages | Configurable resource safeguards, not source restrictions: 100 MB per document, 10 MB per page, no page-count limit by default. Size is checked from `Content-Length` and again while streaming. Over-limit PDFs are rejected, not truncated; such a report can be reviewed, then uploaded manually if it fits the upload limits | `MAX_DOWNLOAD_MB`, `MAX_HTML_SIZE_MB`, `MAX_PDF_PAGES`, `MAX_PDF_SIZE_MB` (uploads) |
@@ -287,15 +287,23 @@ page, context and browser.
 **Managed networks (corporate proxy, web filter, TLS inspection).** The application uses the network the way the
 organisation set it up, and never works around it:
 
-- *Proxy.* `WEB_PROXY_MODE=system` (default) uses `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`, else the Windows Internet
-  Options proxy and its bypass list. `explicit` uses `WEB_PROXY_URL` for every request; `none` connects directly. The
-  proxy is chosen explicitly per request (`.netrc` is never read), and a proxy setting's credentials are never logged.
-  Automatic configuration scripts (PAC/WPAD) are not evaluated: where Windows uses one, ask IT for the proxy address
-  and set `WEB_PROXY_URL`. Web search uses the same proxy.
-- *Sign-in.* The application does not perform Windows integrated (NTLM/Kerberos) proxy sign-in and supplies no
-  credentials of its own. A proxy that requires sign-in answers `407` or a page such as Blue Coat's
-  "Access Denied (authentication_failed)": the assessment then says so, stops trying after `WEB_ACCESS_FAILURE_LIMIT`
-  failures, and continues with uploaded reports. Use only a proxy setting that IT approves for this application.
+- *Proxy.* `WEB_PROXY_MODE=system` (default) uses `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` when set. Otherwise it follows
+  Windows Internet Options the way Windows does: the automatic configuration script (`AutoConfigURL`, PAC) or
+  "Automatically detect settings" (WPAD), evaluated by Windows itself through WinHTTP for each host, then the static
+  proxy and its bypass list. The script's answer is followed as given, including `DIRECT`; the first listed proxy is
+  used. If the script cannot be evaluated, the static proxy (or a direct connection) is used, as Windows does, and the
+  reason is reported. `WEB_PROXY_PAC_URL` evaluates a different script (e.g. when running under a service account).
+  `explicit` uses `WEB_PROXY_URL` for every request; `none` connects directly. The proxy is chosen explicitly per
+  request (`.netrc` is never read), and a proxy setting's credentials are never logged. Web search uses the same proxy.
+- *Sign-in.* Off by default (`WEB_PROXY_AUTH=none`). With `WEB_PROXY_AUTH=integrated`, approved by IT, a proxy that
+  answers `407` is signed in to with a Kerberos ticket for `HTTP/<proxy host>` from the signed-in Windows user's
+  session (SSPI, the mechanism browsers use). No username, password or hash is read, asked for or stored; the ticket
+  is sent only to the proxy, never to websites, never logged, and a fresh one is used for each connection. NTLM is
+  never used (Windows falling back to it is reported instead), and a proxy given only as an IP address cannot be
+  signed in to with Kerberos. Page and document retrieval and the SerpAPI search provider sign in this way; the
+  DuckDuckGo search client cannot. A proxy that refuses the sign-in, or a page such as Blue Coat's
+  "Access Denied (authentication_failed)", is reported and not retried; after `WEB_ACCESS_FAILURE_LIMIT` failures the
+  assessment continues with uploaded reports.
 - *Certificates.* Always verified. With `USE_SYSTEM_TRUST_STORE=true` (default) the operating-system store is used, so an
   authority that IT installed for HTTPS inspection is trusted as it is in the browser. `WEB_CA_BUNDLE` (a PEM file from IT)
   takes precedence and is also passed to the search client, which does not read the Windows store.
@@ -306,7 +314,8 @@ organisation set it up, and never works around it:
 - *Reasons, not waiting.* Proxy sign-in, web-filter blocks, certificate failures, an unreachable proxy, no route to the
   internet and configured size/page limits each produce a plain notice naming the setting involved, and an audit event
   `web_access_diagnostics` with the details (`proxy_authentication_required`, `blocked_by_web_filter`,
-  `tls_verification_failed`, `proxy_connection_failed`, ...).
+  `tls_verification_failed`, `proxy_connection_failed`, `proxy_integrated_signin_unavailable`,
+  `proxy_integrated_signin_refused`, ...), plus the PAC state and sign-in mode.
 - *Diagnostics.* On the computer where access fails, run `python -m app.network_check [url]` from `backend/`. It makes the
   application's own requests through the same settings and reports the route, the result and what to change. It stores
   nothing and prints no credentials.

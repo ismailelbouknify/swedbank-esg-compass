@@ -51,17 +51,34 @@ class SerpAPISearchProvider(SearchProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
 
-    def search(self, query: str, max_results: int) -> list[SearchResult]:
-        url = "https://serpapi.com/search.json"
+    def _get(self, url: str, query: str, max_results: int, proxy: str | None,
+             proxy_headers: dict[str, str] | None) -> httpx.Response:
         try:
-            resp = httpx.get(
+            return httpx.get(
                 url,
                 params={"q": query, "api_key": self.api_key, "num": max_results, "engine": "google"},
                 timeout=bounded_timeout(),
                 trust_env=False,
-                proxy=network.proxy_for(url),
+                proxy=httpx.Proxy(proxy, headers=proxy_headers) if proxy and proxy_headers else proxy,
                 verify=network.ssl_context(),
             )
+        except httpx.ProxyError as exc:
+            if "407" in str(exc) and proxy_headers is not None:
+                raise httpx.ProxyError("407 integrated sign-in refused") from exc
+            if "407" in str(exc) and network.integrated_signin_enabled(proxy):
+                return httpx.Response(407)  # CONNECT refused: let the caller sign in
+            raise
+
+    def search(self, query: str, max_results: int) -> list[SearchResult]:
+        url = "https://serpapi.com/search.json"
+        try:
+            proxy = network.proxy_for(url)
+            resp = self._get(url, query, max_results, proxy, None)
+            if resp.status_code == 407 and network.integrated_signin_enabled(proxy):
+                # the same integrated Windows sign-in as page retrieval: only after the proxy asked for it
+                resp = self._get(url, query, max_results, proxy, network.proxy_signin_header(proxy))
+                if resp.status_code == 407:
+                    raise httpx.ProxyError("407 integrated sign-in refused")
             if resp.status_code == 407:
                 raise httpx.ProxyError("407 Proxy Authentication Required")
             resp.raise_for_status()

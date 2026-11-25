@@ -37,11 +37,15 @@ PROXY_AUTH_REQUIRED = "proxy_authentication_required"
 PROXY_CONNECTION_FAILED = "proxy_connection_failed"
 TLS_VERIFICATION_FAILED = "tls_verification_failed"
 BLOCKED_BY_WEB_FILTER = "blocked_by_web_filter"
+# WEB_PROXY_AUTH=integrated: no Kerberos ticket for the proxy from this Windows session, or the proxy refused it
+PROXY_SIGNIN_UNAVAILABLE = "proxy_integrated_signin_unavailable"
+PROXY_SIGNIN_REFUSED = "proxy_integrated_signin_refused"
 
-NETWORK_ENVIRONMENT_CODES = frozenset({PROXY_AUTH_REQUIRED, PROXY_CONNECTION_FAILED, TLS_VERIFICATION_FAILED, BLOCKED_BY_WEB_FILTER})
+PROXY_SIGNIN_CODES = frozenset({PROXY_AUTH_REQUIRED, PROXY_SIGNIN_UNAVAILABLE, PROXY_SIGNIN_REFUSED})
+NETWORK_ENVIRONMENT_CODES = frozenset({PROXY_CONNECTION_FAILED, TLS_VERIFICATION_FAILED, BLOCKED_BY_WEB_FILTER}) | PROXY_SIGNIN_CODES
 # The request did not get through at all: what decides whether automatic web access is worth continuing
-CONNECTIVITY_FAILURE_CODES = frozenset({PROXY_AUTH_REQUIRED, PROXY_CONNECTION_FAILED, TLS_VERIFICATION_FAILED,
-                                        NETWORK_ERROR, DNS_RESOLUTION_FAILED, SOURCE_TIMEOUT})
+CONNECTIVITY_FAILURE_CODES = frozenset({PROXY_CONNECTION_FAILED, TLS_VERIFICATION_FAILED,
+                                        NETWORK_ERROR, DNS_RESOLUTION_FAILED, SOURCE_TIMEOUT}) | PROXY_SIGNIN_CODES
 AVAILABILITY_CODES = frozenset({DNS_RESOLUTION_FAILED, SOURCE_TIMEOUT, NETWORK_ERROR, HTTP_ERROR, PDF_PARSE_FAILED}) | NETWORK_ENVIRONMENT_CODES
 
 # Audit event per code; a rejected redirect target is always logged as redirect_rejected.
@@ -59,6 +63,8 @@ _AUDIT_EVENTS = {
     PDF_PAGE_LIMIT_EXCEEDED: "pdf_page_limit_exceeded",
     SOURCE_TIMEOUT: "source_timeout",
     PROXY_AUTH_REQUIRED: "network_access_refused",
+    PROXY_SIGNIN_UNAVAILABLE: "network_access_refused",
+    PROXY_SIGNIN_REFUSED: "network_access_refused",
     PROXY_CONNECTION_FAILED: "network_access_refused",
     TLS_VERIFICATION_FAILED: "network_access_refused",
     BLOCKED_BY_WEB_FILTER: "network_access_refused",

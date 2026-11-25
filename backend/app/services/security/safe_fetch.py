@@ -15,7 +15,7 @@ from urllib.parse import urljoin
 import httpx
 
 from app.core.config import Settings, get_settings
-from app.services.security import network, policy
+from app.services.security import network, policy, windows_proxy
 from app.services.security.content_validator import (
     PDF_SIGNATURE,
     classify_content_type,
@@ -59,14 +59,15 @@ def source_deadline() -> float:
     return time.monotonic() + get_settings().max_source_processing_seconds
 
 
-def build_client(proxy: str | None = None) -> httpx.Client:
+def build_client(proxy: str | None = None, proxy_headers: dict[str, str] | None = None) -> httpx.Client:
     """trust_env=False: the proxy is chosen explicitly by network.proxy_for() from the approved settings, so it is
-    known per request (a direct connection is pinned, a proxied one is not); .netrc credentials are never used."""
+    known per request (a direct connection is pinned, a proxied one is not); .netrc credentials are never used.
+    `proxy_headers` carries an integrated sign-in token, sent only to the proxy (CONNECT), never to the site."""
     return httpx.Client(
         timeout=bounded_timeout(),
         follow_redirects=False,
         trust_env=False,
-        proxy=proxy,
+        proxy=httpx.Proxy(proxy, headers=proxy_headers) if proxy and proxy_headers else proxy,
         verify=network.ssl_context(),
         headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/pdf;q=0.9,*/*;q=0.1", "Accept-Encoding": "identity"},
     )
@@ -96,27 +97,57 @@ def fetch(url: str, *, expect: str = "any", client: httpx.Client | None = None, 
 
 
 class _Clients:
-    """The caller's client for every request, or one client per route (direct, or a configured proxy)."""
+    """The caller's client for every request, or one client per route (direct, or a configured proxy).
+
+    A signed-in proxy route gets a new client, so a new connection and a fresh Kerberos ticket, for every request:
+    a proxy refuses a ticket it has already seen (replay protection). Cookies are carried between all clients of
+    one redirect chain and dropped afterwards."""
 
     def __init__(self, given: httpx.Client | None):
         self.given = given
         self.own: dict[str | None, httpx.Client] = {}
+        self.single_use: list[httpx.Client] = []
+        self.cookies = httpx.Cookies()
 
     def for_route(self, proxy: str | None) -> httpx.Client:
         if self.given is not None:
             return self.given
         if proxy not in self.own:
-            try:
-                self.own[proxy] = build_client(proxy) if proxy else build_client()
-            except (OSError, ssl.SSLError) as exc:  # e.g. WEB_CA_BUNDLE points at a missing or invalid file
-                raise FetchError(policy.TLS_VERIFICATION_FAILED,
-                                 f"Certificate configuration unusable: {type(exc).__name__}") from exc
+            self.own[proxy] = self._build(proxy)
         return self.own[proxy]
 
+    def can_sign_in(self, proxy: str | None) -> bool:
+        return self.given is None and network.integrated_signin_enabled(proxy)
+
+    def signed_in(self, proxy: str) -> httpx.Client:
+        try:
+            headers = network.proxy_signin_header(proxy)
+        except windows_proxy.IntegratedAuthUnavailable as exc:
+            raise FetchError(policy.PROXY_SIGNIN_UNAVAILABLE, f"Integrated proxy sign-in unavailable: {exc.reason}") from exc
+        client = self._build(proxy, headers)
+        self.single_use.append(client)
+        return client
+
+    def _build(self, proxy: str | None, headers: dict[str, str] | None = None) -> httpx.Client:
+        try:
+            return build_client(proxy, headers) if proxy else build_client()
+        except (OSError, ssl.SSLError) as exc:  # e.g. WEB_CA_BUNDLE points at a missing or invalid file
+            raise FetchError(policy.TLS_VERIFICATION_FAILED,
+                             f"Certificate configuration unusable: {type(exc).__name__}") from exc
+
+    def before(self, client: httpx.Client) -> None:
+        if client is not self.given:
+            client.cookies.update(self.cookies)
+
+    def after(self, client: httpx.Client) -> None:
+        if client is not self.given:
+            self.cookies.update(client.cookies)
+
     def close(self) -> None:
+        self.cookies.clear()
         if self.given is not None:
             self.given.cookies.clear()
-        for c in self.own.values():
+        for c in [*self.own.values(), *self.single_use]:
             c.cookies.clear()
             c.close()
 
@@ -138,9 +169,9 @@ def _follow_redirects(clients: _Clients, url: str, expect: str, deadline: float,
         except UnsafeURLError as exc:
             raise FetchError(exc.code, str(exc), retryable=exc.retryable, redirected=hop > 0) from exc
         try:
-            client = clients.for_route(proxy)
-            resp = _send_via_proxy(client, target) if proxy else _send_pinned(client, target)
+            client, resp = _send_route(clients, proxy, target)
             try:
+                clients.after(client)
                 if resp.is_redirect:
                     current = urljoin(current, resp.headers["location"])
                     continue
@@ -163,6 +194,44 @@ def _follow_redirects(clients: _Clients, url: str, expect: str, deadline: float,
         except (httpx.InvalidURL, ValueError) as exc:  # malformed Location or host
             raise FetchError(policy.UNSAFE_URL, "Malformed URL", redirected=hop > 0) from exc
     raise FetchError(policy.TOO_MANY_REDIRECTS, f"More than {settings.max_redirects} redirects", redirected=True)
+
+
+def _is_407(exc: httpx.ProxyError) -> bool:
+    return "407" in str(exc)
+
+
+def _send_route(clients: _Clients, proxy: str | None, target: ValidatedURL) -> tuple[httpx.Client, httpx.Response]:
+    """Direct (pinned), through the proxy, or through the proxy with integrated sign-in. Sign-in is only attempted
+    when WEB_PROXY_AUTH=integrated and the proxy asked for it (407); afterwards that proxy is signed in to at once."""
+    if not proxy:
+        client = clients.for_route(None)
+        clients.before(client)
+        return client, _send_pinned(client, target)
+    if not (clients.can_sign_in(proxy) and network.signin_known_required(proxy)):
+        client = clients.for_route(proxy)
+        clients.before(client)
+        try:
+            resp = _send_via_proxy(client, target)
+        except httpx.ProxyError as exc:
+            if not (_is_407(exc) and clients.can_sign_in(proxy)):
+                raise
+        else:
+            if not (resp.status_code == 407 and clients.can_sign_in(proxy)):
+                return client, resp
+            resp.close()
+        network.remember_signin_required(proxy)
+    client = clients.signed_in(proxy)
+    clients.before(client)
+    try:
+        resp = _send_via_proxy(client, target)
+    except httpx.ProxyError as exc:
+        if _is_407(exc):
+            raise FetchError(policy.PROXY_SIGNIN_REFUSED, "The proxy refused the integrated Windows sign-in") from exc
+        raise
+    if resp.status_code == 407:
+        resp.close()
+        raise FetchError(policy.PROXY_SIGNIN_REFUSED, "The proxy refused the integrated Windows sign-in")
+    return client, resp
 
 
 def _send_via_proxy(client: httpx.Client, target: ValidatedURL) -> httpx.Response:
