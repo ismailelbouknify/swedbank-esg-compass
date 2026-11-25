@@ -32,6 +32,8 @@ SOURCE_TIMEOUT = "source_timeout"
 NETWORK_ERROR = "network_error"
 HTTP_ERROR = "http_error"
 PDF_PARSE_FAILED = "pdf_parse_failed"
+# The search service answered, but with a challenge or refusal page instead of results (not worked around)
+SEARCH_REFUSED = "search_service_refused"
 # Network environment: the organisation's network, not this application, refused or could not carry the request
 PROXY_AUTH_REQUIRED = "proxy_authentication_required"
 PROXY_CONNECTION_FAILED = "proxy_connection_failed"
@@ -46,7 +48,7 @@ NETWORK_ENVIRONMENT_CODES = frozenset({PROXY_CONNECTION_FAILED, TLS_VERIFICATION
 # The request did not get through at all: what decides whether automatic web access is worth continuing
 CONNECTIVITY_FAILURE_CODES = frozenset({PROXY_CONNECTION_FAILED, TLS_VERIFICATION_FAILED,
                                         NETWORK_ERROR, DNS_RESOLUTION_FAILED, SOURCE_TIMEOUT}) | PROXY_SIGNIN_CODES
-AVAILABILITY_CODES = frozenset({DNS_RESOLUTION_FAILED, SOURCE_TIMEOUT, NETWORK_ERROR, HTTP_ERROR, PDF_PARSE_FAILED}) | NETWORK_ENVIRONMENT_CODES
+AVAILABILITY_CODES = frozenset({DNS_RESOLUTION_FAILED, SOURCE_TIMEOUT, NETWORK_ERROR, HTTP_ERROR, PDF_PARSE_FAILED, SEARCH_REFUSED}) | NETWORK_ENVIRONMENT_CODES
 
 # Audit event per code; a rejected redirect target is always logged as redirect_rejected.
 _AUDIT_EVENTS = {

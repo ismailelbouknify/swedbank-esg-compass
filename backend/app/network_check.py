@@ -3,6 +3,8 @@
     cd backend
     python -m app.network_check                       # checks https://www.example.com/
     python -m app.network_check https://www.company.com/
+    python -m app.network_check --retrieval-only [url]    # website retrieval only
+    python -m app.network_check --search-only             # web search only
 
 It makes the same requests the application makes, through the same proxy and certificate settings, and says
 what stopped them. It changes nothing, stores nothing and prints no credentials. It does not try to get around
@@ -42,6 +44,9 @@ EXPLANATIONS = {
     policy.NETWORK_ERROR: "No connection could be made. If the network requires a proxy, set WEB_PROXY_URL.",
     policy.SOURCE_TIMEOUT: "The request timed out. Direct connections may be blocked: a proxy may be required.",
     policy.HTTP_ERROR: "The site answered with an error status. The network itself works.",
+    policy.SEARCH_REFUSED: "The search service answered with a challenge page instead of results (it declined automated "
+                           "searches). This is not worked around: configure an approved search API (SEARCH_PROVIDER=serpapi) "
+                           "or give the company website address / upload reports.",
 }
 
 
@@ -172,7 +177,7 @@ def check_proxy_signin(proxy: str | None, url: str) -> None:
 def check_fetch(url: str) -> bool:
     from app.services.security.safe_fetch import fetch
 
-    print(f"\nRetrieval of {url}")
+    print(f"\nWebsite retrieval: {url}")
     started = time.monotonic()
     try:
         res = fetch(url, expect="any")
@@ -187,11 +192,27 @@ def check_fetch(url: str) -> bool:
 def check_search() -> bool:
     from app.services.search.providers import get_search_provider
 
+    from app.services.search import providers as sp
+
     provider = get_search_provider()
-    print(f"\nWeb search ({provider.name})")
+    print(f"\nWeb search: provider {provider.name}")
     if provider.name == "none":
         _line("Result", "web search is turned off or not configured")
         return True
+    probe = {"ddgs": sp.DDGS_ROUTE_PROBE_URL, "duckduckgo_lite": sp.DDG_LITE_URL}.get(provider.name, "https://serpapi.com/")
+    proxy = network.proxy_for(probe)
+    _line("Route", f"via proxy {network.mask_proxy(proxy)}" if proxy else "direct")
+    signin = network.integrated_signin_enabled(proxy)
+    if isinstance(provider, sp.DDGSSearchProvider):
+        if provider._needs_approved_transport():
+            _line("Transport", "application transport (PAC + Windows sign-in), DuckDuckGo lite results page")
+            print("  The DDGS search client cannot sign in to a proxy, so searches use the same transport as retrieval.")
+        else:
+            _line("Transport", "DDGS client (its own HTTP stack; can use a proxy but cannot sign in to one)")
+    elif isinstance(provider, sp.DuckDuckGoLiteSearchProvider):
+        _line("Transport", "application transport (PAC" + (" + Windows sign-in" if signin else "") + "), DuckDuckGo lite")
+    else:
+        _line("Transport", "SerpAPI over the application's proxy settings" + (" with Windows sign-in" if signin else ""))
     started = time.monotonic()
     results = provider.search("sustainability report", max_results=3)
     if provider.last_error:
@@ -216,17 +237,33 @@ def check_local_model() -> None:
 
 
 def main(argv: list[str]) -> int:
-    url = argv[1] if len(argv) > 1 else "https://www.example.com/"
+    flags = {a for a in argv[1:] if a.startswith("--")}
+    args = [a for a in argv[1:] if not a.startswith("--")]
+    url = args[0] if args else "https://www.example.com/"
+    do_fetch, do_search = "--search-only" not in flags, "--retrieval-only" not in flags
     print("Swedbank ESG Compass - network check (no credentials are shown; nothing is stored)\n")
     check_configuration()
-    check_proxy_signin(check_route(url), url)
-    fetched = check_fetch(url)
-    searched = check_search()
-    check_local_model()
+    fetched = searched = None
+    if do_fetch:
+        check_proxy_signin(check_route(url), url)
+        fetched = check_fetch(url)
+    if do_search:
+        searched = check_search()
+    if do_fetch and do_search:
+        check_local_model()
+    print("\nSummary")
+    if fetched is not None:
+        _line("Website retrieval", "OK" if fetched else "FAILED")
+    if searched is not None:
+        _line("Web search", "OK" if searched else "FAILED")
     print()
-    if fetched and searched:
-        print("Automatic source discovery should work on this network.")
+    if fetched is not False and searched is not False:
+        print("Automatic source discovery should work on this network." if do_fetch and do_search else
+              "The checked component works on this network.")
         return 0
+    if fetched and searched is False:
+        print("Websites can be read, but search does not work: give the company website address, or upload reports.")
+        return 1
     print("Automatic source discovery is limited on this network. Assessments still run: upload the company's report")
     print("on the New assessment page, and it is used as the primary source.")
     return 1

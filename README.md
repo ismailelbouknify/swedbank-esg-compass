@@ -128,7 +128,7 @@ All in `backend/.env` (see `backend/.env.example`):
 | `LOCAL_LLM_MODEL_PATH` | `../models/model.gguf` | GGUF path (relative to `backend/`) |
 | `OLLAMA_BASE_URL` / `OLLAMA_MODEL` | `http://localhost:11434` / `llama3.2:1b` | Ollama settings |
 | `ALLOW_HEURISTIC_FALLBACK` | `true` | analyse with keyword/regex extraction when no model |
-| `SEARCH_PROVIDER` | `ddgs` | `ddgs` (no key), `serpapi` (+`SERPAPI_API_KEY`), `none` |
+| `SEARCH_PROVIDER` | `ddgs` | `ddgs` (no key), `duckduckgo_lite` (no key, application transport), `serpapi` (+`SERPAPI_API_KEY`), `none` |
 | `MAX_SEARCH_RESULTS` | `10` | results downloaded from search |
 | `MAX_PAGES_PER_SITE` | `10` | HTML pages fetched per assessment |
 | `MAX_DOWNLOADED_PDFS` | `3` | PDFs downloaded per assessment |
@@ -300,8 +300,13 @@ organisation set it up, and never works around it:
   session (SSPI, the mechanism browsers use). No username, password or hash is read, asked for or stored; the ticket
   is sent only to the proxy, never to websites, never logged, and a fresh one is used for each connection. NTLM is
   never used (Windows falling back to it is reported instead), and a proxy given only as an IP address cannot be
-  signed in to with Kerberos. Page and document retrieval and the SerpAPI search provider sign in this way; the
-  DuckDuckGo search client cannot. A proxy that refuses the sign-in, or a page such as Blue Coat's
+  signed in to with Kerberos. Page and document retrieval and the SerpAPI search provider sign in this way.
+  The DDGS search library uses its own HTTP client (primp), which takes a proxy only as an address and cannot sign in;
+  when integrated sign-in applies to the search route, `SEARCH_PROVIDER=ddgs` therefore searches through the
+  application's own transport instead, reading DuckDuckGo's lite results page (`duckduckgo_lite`, also selectable
+  directly) with the same PAC routing, Kerberos sign-in, certificate and address checks as page retrieval. It
+  identifies the application honestly and imitates no browser; if DuckDuckGo answers with a challenge page instead of
+  results, that is reported (`search_service_refused`) and not worked around. A proxy that refuses the sign-in, or a page such as Blue Coat's
   "Access Denied (authentication_failed)", is reported and not retried; after `WEB_ACCESS_FAILURE_LIMIT` failures the
   assessment continues with uploaded reports.
 - *Certificates.* Always verified. With `USE_SYSTEM_TRUST_STORE=true` (default) the operating-system store is used, so an

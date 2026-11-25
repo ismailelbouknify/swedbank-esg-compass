@@ -73,12 +73,16 @@ def build_client(proxy: str | None = None, proxy_headers: dict[str, str] | None 
     )
 
 
-def fetch(url: str, *, expect: str = "any", client: httpx.Client | None = None, deadline: float | None = None) -> FetchResult:
+def fetch(url: str, *, expect: str = "any", client: httpx.Client | None = None, deadline: float | None = None,
+          purpose: str = "retrieval") -> FetchResult:
     """Retrieve one public PDF or HTML page into memory. `expect` is 'pdf', 'html' or 'any'.
+    `purpose='search'` is a search-results page: it is governed by ENABLE_WEB_SEARCH instead of ENABLE_EXTERNAL_FETCH,
+    and goes through exactly the same proxy, sign-in, certificate, address and size checks.
     Raises FetchError, whose `code` says why; nothing is written to disk."""
     settings = get_settings()
-    if not settings.enable_external_fetch:
-        raise FetchError(policy.EXTERNAL_FETCH_DISABLED, "External retrieval is disabled by configuration")
+    allowed = settings.enable_web_search if purpose == "search" else settings.enable_external_fetch
+    if not allowed:
+        raise FetchError(policy.EXTERNAL_FETCH_DISABLED, f"External {purpose} is disabled by configuration")
     deadline = deadline if deadline is not None else source_deadline()
     clients = _Clients(client)
     try:

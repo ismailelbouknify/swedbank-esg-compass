@@ -1,23 +1,119 @@
-"""Concrete search providers. DDGS (DuckDuckGo) needs no API key; SerpAPI is optional."""
+"""Concrete search providers. DDGS (DuckDuckGo) needs no API key; SerpAPI is optional.
+
+Transports. The DDGS library sends its requests through its own HTTP client (primp), which accepts a proxy only as
+a URL: it cannot add the integrated Windows (Kerberos) proxy sign-in. Where that sign-in is needed, searches go
+through the application's own retrieval transport instead (DuckDuckGoLiteSearchProvider): the same PAC routing,
+Kerberos sign-in, certificate verification, address checks and limits as page retrieval. SerpAPI signs in itself."""
 from __future__ import annotations
 
 import logging
+import re
+import time
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
+from bs4 import BeautifulSoup
 
 from app.core.config import get_settings
 from app.services.search.base import NullSearchProvider, SearchProvider, SearchResult
-from app.services.security import network
-from app.services.security.policy import run_bounded
-from app.services.security.safe_fetch import bounded_timeout
+from app.services.security import network, policy
+from app.services.security.policy import SourceRejection, run_bounded
+from app.services.security.safe_fetch import FetchError, bounded_timeout, fetch
 
 log = logging.getLogger(__name__)
+
+DDG_LITE_URL = "https://lite.duckduckgo.com/lite/"
+DDGS_ROUTE_PROBE_URL = "https://duckduckgo.com/"
+# DuckDuckGo answers suspected automation with a challenge page instead of results; it is reported, never solved
+_CHALLENGE = re.compile(rb"anomaly|captcha|challenge-form|bots use duckduckgo", re.I)
+
+
+def _result_url(href: str) -> str | None:
+    """The target of a DuckDuckGo result link (`//duckduckgo.com/l/?uddg=<url>`); None for ads and internal links."""
+    href = (href or "").strip()
+    if href.startswith("//"):
+        href = "https:" + href
+    try:
+        parts = urlsplit(href)
+    except ValueError:
+        return None
+    host = (parts.hostname or "").lower()
+    if host == "duckduckgo.com" or host.endswith(".duckduckgo.com"):
+        target = parse_qs(parts.query).get("uddg", [None])[0] if parts.path == "/l/" else None
+        return _result_url(target) if target else None
+    return href if parts.scheme in ("http", "https") and host else None
+
+
+def parse_duckduckgo_lite(content: bytes, query: str) -> list[SearchResult]:
+    soup = BeautifulSoup(content, "html.parser")
+    out: list[SearchResult] = []
+    for link in soup.select("a.result-link"):
+        url = _result_url(link.get("href", ""))
+        if not url or any(r.url == url for r in out):
+            continue
+        row = link.find_parent("tr")
+        snippet_cell = None
+        for sibling in (row.find_next_siblings("tr", limit=2) if row else []):
+            snippet_cell = sibling.select_one("td.result-snippet")
+            if snippet_cell:
+                break
+        out.append(SearchResult(title=link.get_text(" ", strip=True), url=url,
+                                snippet=snippet_cell.get_text(" ", strip=True) if snippet_cell else "", query=query))
+    return out
+
+
+class DuckDuckGoLiteSearchProvider(SearchProvider):
+    """DuckDuckGo's lite results page read through the application's retrieval transport (safe_fetch): PAC routing,
+    integrated Windows sign-in, certificate verification, SSRF checks and size/time limits, exactly as for pages.
+    The request identifies this application honestly; no browser is imitated. A challenge or refusal page from
+    DuckDuckGo is reported as `search_service_refused`, never worked around."""
+
+    name = "duckduckgo_lite"
+
+    def __init__(self, client: httpx.Client | None = None):
+        self._client = client  # tests only; a given client never signs in to a proxy
+
+    def search(self, query: str, max_results: int) -> list[SearchResult]:
+        url = f"{DDG_LITE_URL}?{urlencode({'q': query})}"
+        try:
+            res = fetch(url, expect="html", client=self._client, purpose="search",
+                        deadline=time.monotonic() + get_settings().search_timeout_seconds)
+            results = parse_duckduckgo_lite(res.content, query)
+            if not results and _CHALLENGE.search(res.content[:200_000]):
+                raise FetchError(policy.SEARCH_REFUSED, "The search service answered with a challenge page")
+        except SourceRejection as exc:
+            self.failed_searches += 1
+            self.last_error = exc.code
+            log.warning("search_failed: provider=%s reason=%s", self.name, exc.code)
+            return []
+        self.last_error = None
+        return results[:max_results]
 
 
 class DDGSSearchProvider(SearchProvider):
     name = "ddgs"
 
+    def __init__(self) -> None:
+        self._approved: DuckDuckGoLiteSearchProvider | None = None
+        self.transport = "ddgs"
+
+    def _needs_approved_transport(self) -> bool:
+        """The DDGS client cannot sign in to a proxy: when integrated sign-in applies to the search route, use the
+        application's own transport, which can."""
+        return network.integrated_signin_enabled(network.proxy_for(DDGS_ROUTE_PROBE_URL))
+
     def search(self, query: str, max_results: int) -> list[SearchResult]:
+        if self._needs_approved_transport():
+            if self._approved is None:
+                self._approved = DuckDuckGoLiteSearchProvider()
+                log.info("search_transport: provider=ddgs transport=application reason=integrated_proxy_signin")
+            self.transport = "application"
+            before = self._approved.failed_searches
+            results = self._approved.search(query, max_results)
+            self.failed_searches += self._approved.failed_searches - before
+            self.last_error = self._approved.last_error
+            return results
+        self.transport = "ddgs"
         try:
             try:
                 from ddgs import DDGS
@@ -105,6 +201,8 @@ def get_search_provider() -> SearchProvider:
     name = settings.search_provider.lower()
     if name == "ddgs":
         return DDGSSearchProvider()
+    if name == "duckduckgo_lite":
+        return DuckDuckGoLiteSearchProvider()
     if name == "serpapi" and settings.serpapi_api_key:
         return SerpAPISearchProvider(settings.serpapi_api_key)
     return NullSearchProvider()

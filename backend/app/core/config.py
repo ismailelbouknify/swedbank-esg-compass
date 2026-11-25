@@ -43,7 +43,9 @@ class Settings(BaseSettings):
     allow_heuristic_fallback: bool = True
 
     # --- Search / web ----------------------------------------------------
-    search_provider: str = "ddgs"  # ddgs | serpapi | none
+    # ddgs | duckduckgo_lite | serpapi | none. ddgs switches to duckduckgo_lite (the application's own transport)
+    # when the search route needs integrated proxy sign-in, which the DDGS client cannot perform.
+    search_provider: str = "ddgs"
     serpapi_api_key: str = ""
     max_search_results: int = 10
     max_pages_per_site: int = 10

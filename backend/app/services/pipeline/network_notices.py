@@ -21,9 +21,14 @@ SIGNIN_REFUSED_MESSAGE = ("The network proxy did not accept this Windows account
                           "permitted to use the internet through this proxy, or the proxy may need IT to allow this "
                           "application. This application does not try other ways in. " + MANUAL_UPLOAD_HINT)
 SEARCH_SIGNIN_MESSAGE = ("The web search service could not be used because the network proxy requires sign-in, which "
-                         "the search component cannot perform with your Windows account. Pages and documents are still "
-                         "read with integrated sign-in. Ask IT whether the search service may be reached without "
-                         "sign-in, or upload the company's report.")
+                         "the selected search component cannot perform with your Windows account. With "
+                         "SEARCH_PROVIDER=ddgs or duckduckgo_lite, searches use the same Windows sign-in as page "
+                         "retrieval; SerpAPI also supports it. Pages and documents are still read with integrated "
+                         "sign-in. " + MANUAL_UPLOAD_HINT)
+SEARCH_REFUSED_MESSAGE = ("The search service declined automated searches from this application, so no public sources "
+                          "were found by search. This is the service's decision and is not worked around. A company "
+                          "website address and uploaded reports still work; an approved search service with an API "
+                          "key (SEARCH_PROVIDER=serpapi) can be configured instead.")
 WEB_FILTER_MESSAGE = ("The organisation's web filter blocked one or more websites, so they were not read. "
                       + MANUAL_UPLOAD_HINT)
 TLS_MESSAGE = ("Secure connections to websites could not be verified on this network. If the network inspects "
@@ -78,8 +83,10 @@ def network_notices(web: WebAccessState) -> list[str]:
             out.append(DIRECT_UNREACHABLE_MESSAGE + (PAC_HINT if network.windows_autoconfig_url() else ""))
         elif web.fetch_failures or unreachable > 1:
             out.append(CONNECTION_MESSAGE)
+    if web.search_issues[policy.SEARCH_REFUSED] and not web.search_successes:
+        out.append(SEARCH_REFUSED_MESSAGE)
     if web.search_issues and not web.search_successes and not any(
-            m in out for m in (PROXY_AUTH_MESSAGE, SEARCH_SIGNIN_MESSAGE, DIRECT_UNREACHABLE_MESSAGE)):
+            m in out for m in (PROXY_AUTH_MESSAGE, SEARCH_SIGNIN_MESSAGE, SEARCH_REFUSED_MESSAGE, DIRECT_UNREACHABLE_MESSAGE)):
         out.append(SEARCH_MESSAGE)
     if web.fetch_stopped or web.search_stopped:
         out.append(STOPPED_MESSAGE)
