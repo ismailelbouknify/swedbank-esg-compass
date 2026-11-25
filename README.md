@@ -255,7 +255,9 @@ Search (if enabled) -> URL + DNS/IP check (no local/private targets) -> bounded 
 | --- | --- | --- |
 | Manual upload only | No search and no retrieval requests are made; analyses use uploaded PDFs | `ENABLE_WEB_SEARCH=false`, `ENABLE_EXTERNAL_FETCH=false` |
 | URL policy | HTTP and HTTPS to any public host; no credentials, non-standard ports, local names or numeric host tricks | |
-| Network targets | Every address a host resolves to must be public (private, loopback, link-local, metadata, multicast and reserved ranges are refused, for IPv4, IPv6 and IPv4 embedded in IPv6). The connection is pinned to the validated address | |
+| Network targets | Every address a host resolves to must be public (private, loopback, link-local, metadata, multicast and reserved ranges are refused, for IPv4, IPv6 and IPv4 embedded in IPv6). A direct connection is pinned to the validated address; through a configured proxy, see "Managed networks" below | |
+| Proxy and certificates | Only an already-configured proxy is used (environment variables or Windows settings, or an explicit setting). Certificates are always verified, against the organisation's bundle or the operating-system store | `WEB_PROXY_MODE`, `WEB_PROXY_URL`, `USE_SYSTEM_TRUST_STORE`, `WEB_CA_BUNDLE` |
+| Early stop | After repeated network-level failures with nothing getting through, automatic access stops for that assessment and the reason is shown | `WEB_ACCESS_FAILURE_LIMIT`, `SEARCH_TIMEOUT_SECONDS` |
 | Redirects | Up to 5, to any public host (e.g. corporate site to CDN); each target is checked like a new URL, so a redirect cannot reach a local or internal address. Cookies last for one redirect chain | `MAX_REDIRECTS` |
 | Size and pages | Limit checked from `Content-Length` and again while streaming. Over-limit PDFs are rejected, not truncated; such a report can be reviewed, then uploaded manually if it fits the upload limits | `MAX_DOWNLOAD_MB`, `MAX_HTML_SIZE_MB`, `MAX_PDF_PAGES`, `MAX_PDF_SIZE_MB` (uploads) |
 | Time | Connect and read timeouts, a total limit per source, bounded retries with backoff | `HTTP_CONNECT_TIMEOUT_SECONDS`, `HTTP_READ_TIMEOUT_SECONDS`, `MAX_SOURCE_PROCESSING_SECONDS`, `MAX_HTTP_RETRIES` |
@@ -280,8 +282,35 @@ and every navigation with `validate_external_url`, block `file://` and downloads
 redirect limit, block images, media and fonts, use a fresh context without stored profiles or cookies, and always close the
 page, context and browser.
 
-**Outbound proxies.** Requests connect directly and ignore proxy environment variables, so traffic cannot be rerouted silently.
-An installation that must use an outbound or TLS-inspecting proxy needs integration work, or can run in manual-upload-only mode.
+**Managed networks (corporate proxy, web filter, TLS inspection).** The application uses the network the way the
+organisation set it up, and never works around it:
+
+- *Proxy.* `WEB_PROXY_MODE=system` (default) uses `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`, else the Windows Internet
+  Options proxy and its bypass list. `explicit` uses `WEB_PROXY_URL` for every request; `none` connects directly. The
+  proxy is chosen explicitly per request (`.netrc` is never read), and a proxy setting's credentials are never logged.
+  Automatic configuration scripts (PAC/WPAD) are not evaluated: where Windows uses one, ask IT for the proxy address
+  and set `WEB_PROXY_URL`. Web search uses the same proxy.
+- *Sign-in.* The application does not perform Windows integrated (NTLM/Kerberos) proxy sign-in and supplies no
+  credentials of its own. A proxy that requires sign-in answers `407` or a page such as Blue Coat's
+  "Access Denied (authentication_failed)": the assessment then says so, stops trying after `WEB_ACCESS_FAILURE_LIMIT`
+  failures, and continues with uploaded reports. Use only a proxy setting that IT approves for this application.
+- *Certificates.* Always verified. With `USE_SYSTEM_TRUST_STORE=true` (default) the operating-system store is used, so an
+  authority that IT installed for HTTPS inspection is trusted as it is in the browser. `WEB_CA_BUNDLE` (a PEM file from IT)
+  takes precedence and is also passed to the search client, which does not read the Windows store.
+- *SSRF protection through a proxy.* Every URL and redirect target passes the same checks. A name that resolves locally
+  must resolve to public addresses only; a name that does not resolve locally (common behind a proxy, which resolves it
+  instead) is sent to the proxy by hostname. Local-only names (`localhost`, `.local`, `.internal`, `.corp`, ...), IP
+  literals in private ranges, credentials in URLs and non-standard ports are refused before any request either way.
+- *Reasons, not waiting.* Proxy sign-in, web-filter blocks, certificate failures, an unreachable proxy, no route to the
+  internet and configured size/page limits each produce a plain notice naming the setting involved, and an audit event
+  `web_access_diagnostics` with the details (`proxy_authentication_required`, `blocked_by_web_filter`,
+  `tls_verification_failed`, `proxy_connection_failed`, ...).
+- *Diagnostics.* On the computer where access fails, run `python -m app.network_check [url]` from `backend/`. It makes the
+  application's own requests through the same settings and reports the route, the result and what to change. It stores
+  nothing and prints no credentials.
+
+When automatic access is refused, upload the company's report on the new-assessment page: the analysis uses it as the
+primary source. `ENABLE_WEB_SEARCH=false` and `ENABLE_EXTERNAL_FETCH=false` turn automatic access off entirely.
 
 ### Dependency checks
 

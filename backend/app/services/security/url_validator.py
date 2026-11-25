@@ -84,11 +84,15 @@ def resolve_host(host: str, port: int | None, scheme: str) -> tuple[str, ...]:
     return tuple(sorted(addresses, key=lambda a: ":" in a))
 
 
-def validate_external_url(url: str, *, resolve_dns: bool = True) -> ValidatedURL:
+def validate_external_url(url: str, *, resolve_dns: bool = True, allow_unresolved: bool = False) -> ValidatedURL:
     """Return the validated target or raise UnsafeURLError.
 
     Checks scheme, credentials, hostname, port, IP literals and, unless `resolve_dns` is off, every
-    address the hostname resolves to. There is no domain allowlist: any public host is acceptable."""
+    address the hostname resolves to. There is no domain allowlist: any public host is acceptable.
+
+    `allow_unresolved` is for requests that go through a configured proxy, which resolves the name itself: on such
+    networks public names often do not resolve locally. A name that does resolve must still resolve only to public
+    addresses; the hostname checks above apply either way. The result then has no addresses to connect to."""
     url = (url or "").strip()
     if not url or len(url) > MAX_URL_LENGTH or _UNSAFE_URL_CHARS.search(url):
         raise UnsafeURLError(policy.UNSAFE_URL, "URL missing, too long or containing forbidden characters")
@@ -126,8 +130,15 @@ def validate_external_url(url: str, *, resolve_dns: bool = True) -> ValidatedURL
 
     if literal is not None:
         addresses: tuple[str, ...] = (str(literal),)
+    elif not resolve_dns:
+        addresses = ()
     else:
-        addresses = resolve_host(host, port, scheme) if resolve_dns else ()
+        try:
+            addresses = resolve_host(host, port, scheme)
+        except UnsafeURLError as exc:
+            if not (allow_unresolved and exc.code == policy.DNS_RESOLUTION_FAILED):
+                raise
+            addresses = ()
     return ValidatedURL(url=parsed.geturl(), scheme=scheme, host=host, port=port, addresses=addresses)
 
 

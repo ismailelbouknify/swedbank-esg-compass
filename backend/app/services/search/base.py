@@ -16,6 +16,7 @@ class SearchResult:
 class SearchProvider(ABC):
     name: str = "base"
     failed_searches: int = 0  # searches that ended in an error rather than in an empty answer
+    last_error: str | None = None  # why the latest search failed (a policy code), None after a successful one
 
     @abstractmethod
     def search(self, query: str, max_results: int) -> list[SearchResult]:

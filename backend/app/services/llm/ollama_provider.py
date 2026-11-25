@@ -28,7 +28,8 @@ class OllamaProvider(LLMProvider):
         if self._status_cache and now - self._status_cache[0] < 30:
             return self._status_cache[1]
         try:
-            resp = httpx.get(f"{self.base_url}/api/tags", timeout=3)
+            # trust_env=False: a local model must never be reached through (or send report text to) a network proxy
+            resp = httpx.get(f"{self.base_url}/api/tags", timeout=3, trust_env=False)
             resp.raise_for_status()
             names = {m.get("name", "") for m in resp.json().get("models", [])}
             wanted = self.model if ":" in self.model else f"{self.model}:latest"
@@ -57,7 +58,7 @@ class OllamaProvider(LLMProvider):
             "options": {"temperature": 0, "num_predict": max_tokens, "num_ctx": self.num_ctx},
         }
         try:
-            resp = httpx.post(f"{self.base_url}/api/chat", json=payload, timeout=self.timeout)
+            resp = httpx.post(f"{self.base_url}/api/chat", json=payload, timeout=self.timeout, trust_env=False)
             resp.raise_for_status()
         except httpx.HTTPError as exc:
             self._status_cache = None

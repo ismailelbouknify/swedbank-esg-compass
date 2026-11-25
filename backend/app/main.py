@@ -17,6 +17,7 @@ from app.core.config import PROJECT_DIR, get_settings
 from app.db.session import SessionLocal, init_db
 from app.models.entities import Assessment
 from app.services.llm.factory import get_llm_provider
+from app.services.security import network
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("esg")
@@ -49,6 +50,17 @@ async def lifespan(app: FastAPI):
     log.info("Security configuration: restricted_mode=%s web_search=%s external_fetch=%s "
              "max_download_mb=%d max_redirects=%d external_files_stored=False",
              s.bank_safe_mode, s.enable_web_search, s.enable_external_fetch, s.max_download_mb, s.max_redirects)
+    try:  # credentials in a proxy setting are masked; a broken setting is reported by the first request instead
+        net = network.describe()
+        log.info("Network configuration: proxy_mode=%s proxy_source=%s https_proxy=%s pac_script=%s certificates=%s "
+                 "max_pdf_pages=%d max_pdf_size_mb=%d",
+                 net["proxy_mode"], net["proxy_source"], net["https_proxy"], net["pac_script_configured"], net["certificates"],
+                 s.max_pdf_pages, s.max_pdf_size_mb)
+        if net["proxy_source"] == "none" and net["pac_script_configured"] == "yes":
+            log.warning("Windows uses an automatic proxy configuration script, which this application does not read. "
+                        "If websites cannot be reached, set WEB_PROXY_URL to the proxy address IT provides.")
+    except Exception:  # noqa: BLE001
+        log.warning("Network configuration could not be read", exc_info=True)
     if s.enable_playwright:
         log.warning("ENABLE_PLAYWRIGHT is set, but this version contains no browser fetcher: it has no effect.")
     st = get_llm_provider().status()  # never raises: a missing model must not stop the app

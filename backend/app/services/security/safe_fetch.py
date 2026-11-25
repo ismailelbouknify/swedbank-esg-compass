@@ -1,11 +1,13 @@
 """The only path for retrieving external pages and documents.
 
 Normal public HTTP/HTTPS access with basic SSRF protection: every URL and every redirect target is checked
-against localhost/private/link-local/metadata destinations, and the connection goes to the address that
-was checked. Time, size and redirects are bounded. The response is held in memory only: nothing is written
-to disk, and the caller drops the bytes once text has been extracted."""
+against localhost/private/link-local/metadata destinations. A direct connection goes to the address that was
+checked; a request through the configured proxy (see network.py) goes by hostname, because the proxy makes the
+connection. Certificates are always verified. Time, size and redirects are bounded. The response is held in
+memory only: nothing is written to disk, and the caller drops the bytes once text has been extracted."""
 from __future__ import annotations
 
+import ssl
 import time
 from dataclasses import dataclass
 from urllib.parse import urljoin
@@ -13,7 +15,7 @@ from urllib.parse import urljoin
 import httpx
 
 from app.core.config import Settings, get_settings
-from app.services.security import policy
+from app.services.security import network, policy
 from app.services.security.content_validator import (
     PDF_SIGNATURE,
     classify_content_type,
@@ -57,12 +59,15 @@ def source_deadline() -> float:
     return time.monotonic() + get_settings().max_source_processing_seconds
 
 
-def build_client() -> httpx.Client:
-    # trust_env=False: proxy variables and .netrc must not silently change where requests go
+def build_client(proxy: str | None = None) -> httpx.Client:
+    """trust_env=False: the proxy is chosen explicitly by network.proxy_for() from the approved settings, so it is
+    known per request (a direct connection is pinned, a proxied one is not); .netrc credentials are never used."""
     return httpx.Client(
         timeout=bounded_timeout(),
         follow_redirects=False,
         trust_env=False,
+        proxy=proxy,
+        verify=network.ssl_context(),
         headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/pdf;q=0.9,*/*;q=0.1", "Accept-Encoding": "identity"},
     )
 
@@ -74,13 +79,12 @@ def fetch(url: str, *, expect: str = "any", client: httpx.Client | None = None, 
     if not settings.enable_external_fetch:
         raise FetchError(policy.EXTERNAL_FETCH_DISABLED, "External retrieval is disabled by configuration")
     deadline = deadline if deadline is not None else source_deadline()
-    own_client = client is None
-    client = client or build_client()
+    clients = _Clients(client)
     try:
         attempt = 0
         while True:  # bounded: every path either returns, raises, or increments towards max_http_retries
             try:
-                return _follow_redirects(client, url, expect, deadline, settings)
+                return _follow_redirects(clients, url, expect, deadline, settings)
             except FetchError as exc:
                 wait = RETRY_BACKOFF_SECONDS * (2 ** attempt)
                 if not exc.retryable or attempt >= settings.max_http_retries or time.monotonic() + wait >= deadline:
@@ -88,9 +92,33 @@ def fetch(url: str, *, expect: str = "any", client: httpx.Client | None = None, 
             time.sleep(wait)
             attempt += 1
     finally:
-        client.cookies.clear()  # cookies live for one redirect chain only
-        if own_client:
-            client.close()
+        clients.close()  # cookies live for one redirect chain only
+
+
+class _Clients:
+    """The caller's client for every request, or one client per route (direct, or a configured proxy)."""
+
+    def __init__(self, given: httpx.Client | None):
+        self.given = given
+        self.own: dict[str | None, httpx.Client] = {}
+
+    def for_route(self, proxy: str | None) -> httpx.Client:
+        if self.given is not None:
+            return self.given
+        if proxy not in self.own:
+            try:
+                self.own[proxy] = build_client(proxy) if proxy else build_client()
+            except (OSError, ssl.SSLError) as exc:  # e.g. WEB_CA_BUNDLE points at a missing or invalid file
+                raise FetchError(policy.TLS_VERIFICATION_FAILED,
+                                 f"Certificate configuration unusable: {type(exc).__name__}") from exc
+        return self.own[proxy]
+
+    def close(self) -> None:
+        if self.given is not None:
+            self.given.cookies.clear()
+        for c in self.own.values():
+            c.cookies.clear()
+            c.close()
 
 
 def _check_deadline(deadline: float) -> None:
@@ -98,18 +126,20 @@ def _check_deadline(deadline: float) -> None:
         raise FetchError(policy.SOURCE_TIMEOUT, "Source processing time limit reached")
 
 
-def _follow_redirects(client: httpx.Client, url: str, expect: str, deadline: float, settings: Settings) -> FetchResult:
+def _follow_redirects(clients: _Clients, url: str, expect: str, deadline: float, settings: Settings) -> FetchResult:
     """Redirects to any public host are followed (corporate site -> CDN or filing host is normal);
     each target is validated again, so a redirect can never reach a local or internal address."""
     current = url
     for hop in range(settings.max_redirects + 1):
         _check_deadline(deadline)
+        proxy = network.proxy_for(current)
         try:
-            target = validate_external_url(current)
+            target = validate_external_url(current, allow_unresolved=proxy is not None)
         except UnsafeURLError as exc:
             raise FetchError(exc.code, str(exc), retryable=exc.retryable, redirected=hop > 0) from exc
         try:
-            resp = _send_pinned(client, target)
+            client = clients.for_route(proxy)
+            resp = _send_via_proxy(client, target) if proxy else _send_pinned(client, target)
             try:
                 if resp.is_redirect:
                     current = urljoin(current, resp.headers["location"])
@@ -121,11 +151,23 @@ def _follow_redirects(client: httpx.Client, url: str, expect: str, deadline: flo
             raise
         except httpx.TimeoutException as exc:
             raise FetchError(policy.SOURCE_TIMEOUT, "Request timed out", retryable=True) from exc
+        except httpx.ProxyError as exc:  # the proxy refused CONNECT, e.g. "407 Proxy Authentication Required"
+            code = policy.PROXY_AUTH_REQUIRED if "407" in str(exc) else policy.PROXY_CONNECTION_FAILED
+            raise FetchError(code, f"Proxy refused the connection: {str(exc)[:80]}") from exc
         except httpx.HTTPError as exc:
+            if network.is_certificate_failure(exc):
+                raise FetchError(policy.TLS_VERIFICATION_FAILED, "Server certificate could not be verified") from exc
+            if proxy and isinstance(exc, httpx.ConnectError):
+                raise FetchError(policy.PROXY_CONNECTION_FAILED, "Proxy could not be reached", retryable=True) from exc
             raise FetchError(policy.NETWORK_ERROR, f"Network error: {type(exc).__name__}", retryable=True) from exc
         except (httpx.InvalidURL, ValueError) as exc:  # malformed Location or host
             raise FetchError(policy.UNSAFE_URL, "Malformed URL", redirected=hop > 0) from exc
     raise FetchError(policy.TOO_MANY_REDIRECTS, f"More than {settings.max_redirects} redirects", redirected=True)
+
+
+def _send_via_proxy(client: httpx.Client, target: ValidatedURL) -> httpx.Response:
+    """The proxy connects to the host by name; the certificate is still checked against that name."""
+    return client.send(client.build_request("GET", target.url), stream=True)
 
 
 def _send_pinned(client: httpx.Client, target: ValidatedURL) -> httpx.Response:
@@ -148,6 +190,9 @@ def _send_pinned(client: httpx.Client, target: ValidatedURL) -> httpx.Response:
 def _read_body(resp: httpx.Response, url: str, current: str, expect: str, deadline: float,
                settings: Settings) -> FetchResult:
     if not 200 <= resp.status_code < 300:
+        refused = network.classify_block_page(resp.status_code, _peek(resp, deadline))
+        if refused:
+            raise FetchError(refused, f"HTTP {resp.status_code} from the network proxy or web filter")
         raise FetchError(policy.HTTP_ERROR, f"HTTP {resp.status_code}", retryable=resp.status_code in RETRYABLE_STATUS)
     content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
     declared = classify_content_type(content_type)
@@ -184,6 +229,10 @@ def _read_body(resp: httpx.Response, url: str, current: str, expect: str, deadli
         raise FetchError(policy.INVALID_CONTENT_TYPE, f"Unexpected content {content_type!r}")
     if kind == "html" and len(content) > html_limit:
         raise FetchError(policy.DOWNLOAD_SIZE_LIMIT_EXCEEDED, f"Page exceeds {html_limit} bytes")
+    if kind == "html" and len(content) <= network.BLOCK_PAGE_SCAN_BYTES:
+        refused = network.classify_block_page(resp.status_code, content)  # some filters answer 200 with their own page
+        if refused:
+            raise FetchError(refused, "Page served by the network proxy or web filter instead of the site")
     digest = sha256_hex(content)
     try:
         scan_status = enforce_scan(content, kind=kind, sha256=digest)
@@ -191,3 +240,19 @@ def _read_body(resp: httpx.Response, url: str, current: str, expect: str, deadli
         raise FetchError(exc.code, str(exc)) from exc
     return FetchResult(url=url, final_url=current, content_type=content_type, content=content, kind=kind,
                        sha256=digest, size=len(content), scan_status=scan_status)
+
+
+def _peek(resp: httpx.Response, deadline: float) -> bytes:
+    """The start of an error page, enough to recognise a proxy or web filter page; never the whole body."""
+    content_type = resp.headers.get("content-type", "").lower()
+    if content_type and "html" not in content_type and "text" not in content_type:
+        return b""
+    buffer = bytearray()
+    try:
+        for chunk in resp.iter_bytes(READ_CHUNK_BYTES):
+            buffer.extend(chunk)
+            if len(buffer) >= network.BLOCK_PAGE_SCAN_BYTES or time.monotonic() >= deadline:
+                break
+    except httpx.HTTPError:
+        pass
+    return bytes(buffer[:network.BLOCK_PAGE_SCAN_BYTES])

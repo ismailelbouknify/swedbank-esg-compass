@@ -57,6 +57,19 @@ class Settings(BaseSettings):
     http_connect_timeout_seconds: float = 10
     http_read_timeout_seconds: float = 30
     max_source_processing_seconds: float = 120  # one source, from first request to extracted text
+    search_timeout_seconds: float = 60  # one search query, including every engine the provider tries
+
+    # --- Network environment (proxy / certificates) ----------------------
+    # Only a proxy that the user or IT already configured is used; certificates are always verified.
+    # system: HTTPS_PROXY/HTTP_PROXY/NO_PROXY, else the Windows Internet Options proxy (PAC scripts are not evaluated)
+    # explicit: WEB_PROXY_URL | none: direct connections only
+    web_proxy_mode: str = "system"
+    web_proxy_url: str = ""  # explicit mode; may hold IT-issued proxy credentials, which are never logged
+    use_system_trust_store: bool = True  # trust the certificate authorities installed in the operating system
+    web_ca_bundle: str = ""  # PEM file with the organisation's certificate authorities (takes precedence)
+    # Stop automatic web access for the rest of an assessment after this many network-level failures in a row
+    # with nothing ever succeeding (fetches and searches counted separately). 0 = never stop early.
+    web_access_failure_limit: int = 3
 
     # --- Source coverage / recovery search -------------------------------
     coverage_min_valid_sources: int = 3

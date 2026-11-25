@@ -32,8 +32,17 @@ SOURCE_TIMEOUT = "source_timeout"
 NETWORK_ERROR = "network_error"
 HTTP_ERROR = "http_error"
 PDF_PARSE_FAILED = "pdf_parse_failed"
+# Network environment: the organisation's network, not this application, refused or could not carry the request
+PROXY_AUTH_REQUIRED = "proxy_authentication_required"
+PROXY_CONNECTION_FAILED = "proxy_connection_failed"
+TLS_VERIFICATION_FAILED = "tls_verification_failed"
+BLOCKED_BY_WEB_FILTER = "blocked_by_web_filter"
 
-AVAILABILITY_CODES = frozenset({DNS_RESOLUTION_FAILED, SOURCE_TIMEOUT, NETWORK_ERROR, HTTP_ERROR, PDF_PARSE_FAILED})
+NETWORK_ENVIRONMENT_CODES = frozenset({PROXY_AUTH_REQUIRED, PROXY_CONNECTION_FAILED, TLS_VERIFICATION_FAILED, BLOCKED_BY_WEB_FILTER})
+# The request did not get through at all: what decides whether automatic web access is worth continuing
+CONNECTIVITY_FAILURE_CODES = frozenset({PROXY_AUTH_REQUIRED, PROXY_CONNECTION_FAILED, TLS_VERIFICATION_FAILED,
+                                        NETWORK_ERROR, DNS_RESOLUTION_FAILED, SOURCE_TIMEOUT})
+AVAILABILITY_CODES = frozenset({DNS_RESOLUTION_FAILED, SOURCE_TIMEOUT, NETWORK_ERROR, HTTP_ERROR, PDF_PARSE_FAILED}) | NETWORK_ENVIRONMENT_CODES
 
 # Audit event per code; a rejected redirect target is always logged as redirect_rejected.
 _AUDIT_EVENTS = {
@@ -49,6 +58,10 @@ _AUDIT_EVENTS = {
     INVALID_PDF_SIGNATURE: "invalid_pdf_signature",
     PDF_PAGE_LIMIT_EXCEEDED: "pdf_page_limit_exceeded",
     SOURCE_TIMEOUT: "source_timeout",
+    PROXY_AUTH_REQUIRED: "network_access_refused",
+    PROXY_CONNECTION_FAILED: "network_access_refused",
+    TLS_VERIFICATION_FAILED: "network_access_refused",
+    BLOCKED_BY_WEB_FILTER: "network_access_refused",
 }
 
 

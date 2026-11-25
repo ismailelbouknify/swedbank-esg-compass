@@ -29,7 +29,7 @@ from app.services.pipeline.source_gate import (
 )
 from app.services.extraction.patterns import YEAR_RE
 from app.services.search.base import SearchProvider, SearchResult, build_factor_recovery_queries, build_queries, build_recovery_queries
-from app.services.security import policy
+from app.services.security import network, policy
 from app.services.security.policy import SourceRejection
 from app.services.security.safe_fetch import FetchResult, fetch, source_deadline
 from app.services.security.url_validator import UnsafeURLError, validate_external_url
@@ -88,6 +88,54 @@ def _find_report_links(content, official_domain: str | None, year: int | None = 
 
 
 @dataclass
+class WebAccessState:
+    """How the network has treated this assessment's requests, across discovery and recovery.
+
+    When nothing has ever got through and `limit` requests in a row have failed at network level (proxy refusal,
+    certificate failure, no connection), more attempts would only add waiting time: automatic access stops and the
+    assessment continues with what it has. Fetches and searches are judged separately: a search service can be
+    blocked while company websites are reachable. A web filter blocking one site says nothing about the next."""
+    limit: int = 0
+    fetch_failures: int = 0
+    fetch_successes: int = 0
+    search_failures: int = 0
+    search_successes: int = 0
+    issues: Counter = field(default_factory=Counter)  # policy code -> count, fetches and candidate checks
+    search_issues: Counter = field(default_factory=Counter)
+    skipped_searches: int = 0
+
+    def record_fetch(self, code: str | None) -> None:
+        """One fetch outcome: None when the site answered with usable content."""
+        if code is None:
+            self.fetch_successes += 1
+            self.fetch_failures = 0
+            return
+        if code not in (policy.DOWNLOAD_SIZE_LIMIT_EXCEEDED, policy.PDF_PAGE_LIMIT_EXCEEDED):
+            self.issues[code] += 1  # limits are counted where the source is marked, whatever stage refused it
+        if code in policy.CONNECTIVITY_FAILURE_CODES:
+            self.fetch_failures += 1
+        elif code != policy.BLOCKED_BY_WEB_FILTER:  # an answer from the site itself: the network works
+            self.fetch_successes += 1
+            self.fetch_failures = 0
+
+    def record_search(self, code: str | None) -> None:
+        if code is None:
+            self.search_successes += 1
+            self.search_failures = 0
+        else:
+            self.search_issues[code] += 1
+            self.search_failures += 1
+
+    @property
+    def fetch_stopped(self) -> bool:
+        return self.limit > 0 and not self.fetch_successes and self.fetch_failures >= self.limit
+
+    @property
+    def search_stopped(self) -> bool:
+        return self.limit > 0 and not self.search_successes and self.search_failures >= self.limit
+
+
+@dataclass
 class DiscoveryReport:
     queries: list[str] = field(default_factory=list)
     results_seen: int = 0
@@ -102,6 +150,7 @@ class DiscoveryReport:
     fetch_seconds: float = 0.0  # HTTP time, all sources
     pdf_parse_seconds: float = 0.0  # PDF text extraction time
     duplicate_documents: int = 0  # byte-identical to a document already read in this assessment: not parsed again
+    web: WebAccessState = field(default_factory=WebAccessState)
 
     @property
     def coverage_limited(self) -> bool:
@@ -157,10 +206,12 @@ def _admit(db: Session, a: Assessment, url: str, report: DiscoveryReport) -> boo
     """Security validation of a candidate URL, before it can become a source or use up a budget."""
     db.commit()  # never hold the SQLite write lock during network I/O (DNS)
     try:
-        validate_external_url(url)
+        validate_external_url(url, allow_unresolved=network.proxy_for(url) is not None)
         return True
     except UnsafeURLError as exc:
         report.candidates_rejected += 1
+        if exc.code == policy.DNS_RESOLUTION_FAILED:
+            report.web.issues[exc.code] += 1
         log_source_rejection(db, exc, assessment_id=a.id, url=url, stage="candidate")
         return False
 
@@ -175,6 +226,8 @@ def _mark_unprocessed(db: Session, s: Source, exc: SourceRejection, report: Disc
         report.sources_unavailable += 1
     s.status_detail = str(exc)[:500]
     s.fetch_outcome = exc.code
+    if exc.code in (policy.DOWNLOAD_SIZE_LIMIT_EXCEEDED, policy.PDF_PAGE_LIMIT_EXCEEDED):
+        report.web.issues[exc.code] += 1
     log_source_rejection(db, exc, assessment_id=s.assessment_id, url=s.url, source_id=s.id)
 
 
@@ -217,11 +270,13 @@ def _download_into(db: Session, s: Source, report: DiscoveryReport, expect: str 
     try:
         res = fetch(s.url, expect=expect, deadline=deadline)
     except SourceRejection as exc:
+        report.web.record_fetch(exc.code)
         _mark_unprocessed(db, s, exc, report)
         db.commit()
         return None
     finally:
         report.fetch_seconds += time.monotonic() - fetch_started
+    report.web.record_fetch(None)
     twin = _identical_document(db, s, res.sha256) if res.kind == "pdf" else None
     if twin is not None:
         # the same PDF under another address (a mirror, a CDN copy, a tracking link): parsed once. Web pages are
@@ -274,6 +329,9 @@ class _Pass:
     deadline: float | None = None
 
     def out_of_time(self) -> bool:
+        """Also true once the network has refused every request: no further source is attempted."""
+        if self.report.web.fetch_stopped:
+            return True
         return self.deadline is not None and time.monotonic() >= self.deadline
 
     def follow_report_links(self, content, page_url: str, via: str, hops: int = PRIMARY_DOCUMENT_HOPS) -> None:
@@ -377,21 +435,26 @@ def _run_searches(provider: SearchProvider, queries: list[str], report: Discover
     for n, q in enumerate(queries, 1):
         if deadline is not None and time.monotonic() >= deadline:
             break
+        if report.web.search_stopped:
+            report.web.skipped_searches += len(queries) - n + 1
+            break
         if n > 1 and pause:
             time.sleep(pause)
         progress(f"Searching the web ({n}/{len(queries)}): {q}")
         report.queries.append(q)
+        failed = provider.failed_searches
         results.extend(r for r in provider.search(q, max_results=settings.max_search_results) if _well_formed(r.url))
+        report.web.record_search((provider.last_error or policy.NETWORK_ERROR) if provider.failed_searches > failed else None)
     report.searches_failed += provider.failed_searches - failed_before
     report.results_seen += len(results)
     return results
 
 
 def discover(db: Session, a: Assessment, provider: SearchProvider, do_search: bool,
-             on_progress: Callable[[str], None] | None = None) -> DiscoveryReport:
+             on_progress: Callable[[str], None] | None = None, web: WebAccessState | None = None) -> DiscoveryReport:
     settings = get_settings()
     company = a.company
-    report = DiscoveryReport(official_domain=company.domain)
+    report = DiscoveryReport(official_domain=company.domain, web=web or WebAccessState(settings.web_access_failure_limit))
     progress = on_progress or (lambda _msg: None)
     run = _Pass(db, a, report, progress, _SeenUrls(s.url for s in a.sources if s.url), settings.max_downloaded_pdfs,
                 settings.max_pages_per_site, settings.max_search_results)
@@ -404,8 +467,12 @@ def discover(db: Session, a: Assessment, provider: SearchProvider, do_search: bo
             fetch_started = time.monotonic()
             try:
                 home = fetch(company.website, expect="html")
+            except SourceRejection as exc:
+                report.web.record_fetch(exc.code)
+                raise
             finally:
                 report.fetch_seconds += time.monotonic() - fetch_started
+            report.web.record_fetch(None)
             content = extract_html(home.content, home.final_url)
             report.official_domain = company.domain = registrable_domain(home.final_url) or company.domain
             s = _new_source(db, a, home.final_url, content.title or company.name, "company_website", True, "company website")
@@ -417,6 +484,8 @@ def discover(db: Session, a: Assessment, provider: SearchProvider, do_search: bo
             # Follow links to primary report PDFs found on the homepage.
             run.follow_report_links(content, home.final_url, "company website homepage")
             for link in relevant_links(content, report.official_domain, limit=settings.max_pages_per_site):
+                if report.web.fetch_stopped:
+                    break
                 if link in run.seen_urls or run.html_budget <= 0:
                     continue
                 is_pdf = link.lower().split("?")[0].endswith(".pdf")
@@ -465,12 +534,13 @@ def discover(db: Session, a: Assessment, provider: SearchProvider, do_search: bo
 
 
 def recover_sources(db: Session, a: Assessment, provider: SearchProvider, earlier_queries: list[str],
-                    on_progress: Callable[[str], None] | None = None, weak_factors: list[str] | None = None) -> DiscoveryReport:
+                    on_progress: Callable[[str], None] | None = None, weak_factors: list[str] | None = None,
+                    web: WebAccessState | None = None) -> DiscoveryReport:
     """The single bounded extra search when coverage is too thin: queries targeted at the factors with weak
     coverage first, then broader report queries; the same hard gates, and the identity settled earlier is never changed."""
     settings = get_settings()
     company = a.company
-    report = DiscoveryReport(official_domain=company.domain)
+    report = DiscoveryReport(official_domain=company.domain, web=web or WebAccessState(settings.web_access_failure_limit))
     progress = on_progress or (lambda _msg: None)
     deadline = time.monotonic() + settings.recovery_time_budget_seconds
     profile = a.company_identity or {}

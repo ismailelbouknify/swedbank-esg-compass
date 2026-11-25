@@ -31,12 +31,13 @@ from app.services.company.source_identity import SOURCE_COMPANY_MISMATCH
 from app.services.documents.url_safety import registrable_domain
 from app.services.extraction import patterns as P
 from app.services.extraction.extractor import Candidate, FactExtractor, Passage, passage_signal
-from app.services.llm.base import LLM_NOT_CONFIGURED_MESSAGE, LLMProvider
+from app.services.llm.base import LLM_NOT_CONFIGURED_MESSAGE, LLMProvider, LLMStatus, NullLLMProvider
 from app.services.llm.factory import get_llm_provider
 from app.services.pipeline.coverage import (
     AMBIGUOUS_COMPANY_MESSAGE, BLOCKED_REPORT_MESSAGE, BLOCKED_REPORT_REASON, INSUFFICIENT_COVERAGE_MESSAGE, INSUFFICIENT_SOURCE_COVERAGE, NOT_ASSESSED_LEVEL, CoverageCheck, assess_coverage, coverage_state,
 )
-from app.services.pipeline.discovery import discover, recover_sources
+from app.services.pipeline.discovery import WebAccessState, discover, recover_sources
+from app.services.pipeline.network_notices import network_audit_details, network_notices
 from app.services.pipeline.ingest import ingest_pdf
 from app.services.pipeline.source_gate import apply_source_identity, identity_for, source_blocks_evidence
 from app.services.retrieval.bm25 import BM25Index, query_for
@@ -48,7 +49,7 @@ from app.services.scoring.planning import score_planning
 from app.services.scoring.reporting import score_reporting
 from app.services.search.base import SearchProvider
 from app.services.search.providers import get_search_provider
-from app.services.security.policy import SourceRejection
+from app.services.security.policy import SourceRejection, run_bounded
 from app.services.verification.verifier import VERIFIED, verify_candidate
 
 log = logging.getLogger(__name__)
@@ -63,6 +64,7 @@ STAGES = [
     "Preparing assessment",
 ]
 STAGE_PROGRESS = [5, 15, 30, 40, 45, 90, 97]
+LLM_STATUS_TIMEOUT_SECONDS = 60
 EXTERNAL_ACCESS_OFF_MESSAGE = ("Automatic search and retrieval of public sources are turned off for this installation. "
                                "Upload the sustainability report to include it in the analysis.")
 COMPANY_MISMATCH_MESSAGE = ("One or more documents did not appear to concern the assessed company and were not used. "
@@ -98,6 +100,7 @@ class AssessmentRunner:
         self.discovery_counts: dict[str, int] = {}
         self.discovery_queries: list[str] = []
         self.stage_seconds: dict[str, float] = {}
+        self.web = WebAccessState(self.settings.web_access_failure_limit)  # one view of the network per assessment
         self.llm_calls = 0
         self.llm_seconds = 0.0
         self.duplicate_passages = 0
@@ -211,7 +214,7 @@ class AssessmentRunner:
         self.a.normalized_company_name = c.normalized_name
         if c.website and not c.domain:
             c.domain = registrable_domain(c.website)
-        st = self.llm.status()
+        st = self._llm_status()
         self.a.llm_provider = st.provider
         self.a.llm_model = st.model if st.available else None
         if not st.available:
@@ -223,6 +226,17 @@ class AssessmentRunner:
         log_event(self.db, "company_identified", assessment_id=self.a.id, entity_type="company", entity_id=c.id,
                   details={"name": c.name, "normalized": c.normalized_name, "domain": c.domain})
         self.db.commit()
+
+    def _llm_status(self) -> LLMStatus:
+        """status() is meant to be cheap and never raise, but loading a local library can fail (or stall) on a managed
+        computer, e.g. when endpoint protection blocks a DLL. Then the analysis continues without the model."""
+        try:
+            return run_bounded(self.llm.status, LLM_STATUS_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("llm_status_failed: provider=%s error=%s", getattr(self.llm, "provider_name", "?"), type(exc).__name__)
+            msg = f"The local analysis component could not be started on this computer ({type(exc).__name__})."
+            self.llm = NullLLMProvider(msg)
+            return self.llm.status()
 
     def _search(self) -> None:
         self._stage(1)
@@ -240,7 +254,7 @@ class AssessmentRunner:
                 self.warnings.append("No report uploaded, no website given and web search disabled: nothing to review.")
         if do_search or fetch_website:
             rep = discover(self.db, self.a, self.search, do_search=do_search,
-                           on_progress=lambda msg: self._stage(1, msg[:300]))
+                           on_progress=lambda msg: self._stage(1, msg[:300]), web=self.web)
             self.warnings.extend(rep.warnings)
             if rep.coverage_limited:
                 self.warnings.append(COVERAGE_LIMITED_MESSAGE)
@@ -312,7 +326,8 @@ class AssessmentRunner:
         # more searching cannot tell which company is meant: only the analyst can
         ambiguous = (self.a.company_identity or {}).get("status") == AMBIGUOUS
         allowed = (settings.recovery_search_enabled and self.a.enable_web_search and settings.enable_web_search
-                   and settings.enable_external_fetch and not has_valid_upload and not ambiguous)
+                   and settings.enable_external_fetch and not has_valid_upload and not ambiguous
+                   and not (self.web.search_stopped and self.web.fetch_stopped))
         reasons = list(check.recovery_reasons) + [f"weak_factor_coverage:{f}" for f in weak]
         if not reasons or not allowed or self.recovery_runs >= 1:
             return False
@@ -321,7 +336,7 @@ class AssessmentRunner:
         log_event(self.db, "recovery_search_started", assessment_id=self.a.id, details={"reasons": reasons, "weak_factors": weak})
         self.recovery_reasons = reasons
         rep = recover_sources(self.db, self.a, self.search, self.discovery_queries, on_progress=lambda msg: self._stage(1, msg[:300]),
-                              weak_factors=weak)
+                              weak_factors=weak, web=self.web)
         self._add_discovery_counts(rep)
         log_event(self.db, "recovery_search_completed", assessment_id=self.a.id,
                   details={"queries": rep.queries, "results_seen": rep.results_seen, "sources_processed": rep.sources_processed,
@@ -330,7 +345,17 @@ class AssessmentRunner:
         self.db.refresh(self.a)
         return True
 
+    def _report_web_access(self) -> None:
+        """Why the network or a configured limit kept sources out, in plain words; the details go to the audit log."""
+        notices = network_notices(self.web)
+        if notices or self.web.issues or self.web.search_issues:
+            log_event(self.db, "web_access_diagnostics", assessment_id=self.a.id, details=network_audit_details(self.web))
+        for msg in notices:
+            if msg not in self.warnings:
+                self.warnings.append(msg)
+
     def _report_final_coverage(self) -> None:
+        self._report_web_access()
         if (self.a.company_identity or {}).get("status") == AMBIGUOUS:
             self.warnings.append(AMBIGUOUS_COMPANY_MESSAGE)
         for blocked in self.coverage.blocked_primary_reports:
