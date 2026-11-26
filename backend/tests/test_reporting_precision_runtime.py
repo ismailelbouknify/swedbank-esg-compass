@@ -196,5 +196,5 @@ def test_without_the_budget_the_same_question_is_an_honest_no_evidence(client, w
     rec = recs[("data_security", "planning")]
     # an honest "no evidence found": recorded as not assessed (0), never as an automatic Level 1
     assert rec.coverage_state == "NO_EVIDENCE_FOUND" and rec.recommended_level == 0
-    assert rec.reason.startswith("Insufficient evidence to recommend an assessment level.")
+    assert rec.reason.startswith("No supporting evidence found.")
 

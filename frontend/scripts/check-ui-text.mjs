@@ -45,6 +45,13 @@ expect(brand.includes('LOGO_SRC = "/swedbank-logo.svg"') && !/https?:\/\//.test(
 expect(read("index.html").includes("<title>Swedbank ESG Compass</title>"), "index.html title must be Swedbank ESG Compass");
 expect(read("src/pages/QuestionnaireExample.tsx").includes("Reference criteria used by Swedbank ESG Compass"),
   "questionnaire page must say: Reference criteria used by Swedbank ESG Compass");
+// when no score is recommended, the UI says why with exactly these labels, from one helper
+const format = read("src/format.ts");
+for (const label of ["No supporting evidence found", "Evidence could not be verified", "Insufficient source coverage"])
+  expect(format.includes(`"${label}"`), `format.ts must define the label "${label}"`);
+for (const f of ["src/components/AssessmentCell.tsx", "src/components/ReviewDrawer.tsx", "src/pages/AssessmentReport.tsx"])
+  expect(read(f).includes("noLevelLabel("), `${f} must show the no-score label from noLevelLabel()`);
+expect(!src.some((f) => read(f).includes("Insufficient evidence to recommend")), "the old withheld-answer wording must be gone");
 if (dist.length) {
   const bundle = dist.map(read).join("\n");
   for (const s of ["Swedbank ESG Compass", "Evidence-based sustainability assessment", "Reference criteria used by Swedbank ESG Compass", "/swedbank-logo.svg"])

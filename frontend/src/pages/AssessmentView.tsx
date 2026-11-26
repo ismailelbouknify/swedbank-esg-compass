@@ -11,7 +11,7 @@ import ExportMenu from "../components/ExportMenu";
 import ReviewDrawer from "../components/ReviewDrawer";
 import SourceList from "../components/SourceList";
 import { useDocumentTitle } from "../brand";
-import { STATUS_LABEL, formatDate } from "../format";
+import { STATUS_LABEL, formatDate, isDataGap } from "../format";
 
 const DIM_ORDER = ["reporting", "planning", "execution", "performance"];
 type Tab = "assessment" | "sources" | "audit";
@@ -65,7 +65,7 @@ export default function AssessmentView() {
   const pending = ordered.filter((r) => r.review_status === "PENDING");
   // items with evidence first; data gaps after
   const reviewQueue = [...pending.filter((r) => r.review_state === "review"), ...pending.filter((r) => r.review_state === "no_evidence")];
-  const gaps = ordered.filter((r) => r.evidence_status === "NO_EVIDENCE_FOUND" || r.evidence_status === "INSUFFICIENT_SOURCE_COVERAGE");
+  const gaps = ordered.filter(isDataGap);
 
   // the next pending item after the open one (wrapping around); an item just approved has left the queue
   const nextAfter = (current: number | null): Recommendation | undefined => {

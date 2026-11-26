@@ -27,6 +27,7 @@ from app.services.audit import log_event, log_source_rejection
 from app.services.company.identify import normalize_company_name, normalize_org_number
 from app.services.documents.url_safety import normalize_website, registrable_domain
 from app.services.export import exporter
+from app.services.pipeline import stop
 from app.services.pipeline.runner import run_assessment
 from app.services.presentation import EXPORT_FILE_PREFIX, PUBLIC_STAGES, public_stage
 from app.services.security import policy
@@ -205,6 +206,19 @@ def run(assessment_id: int, background: BackgroundTasks, db: Session = Depends(g
     return _status(a)
 
 
+@router.post("/{assessment_id}/stop", response_model=StatusOut, status_code=202)
+def stop_analysis(assessment_id: int, db: Session = Depends(get_db)) -> StatusOut:
+    """Ask a running analysis to stop. It ends as stopped (status FAILED with that reason) within moments, and can be
+    started again with /run. Sources and documents already read are kept; no recommendations are written."""
+    a = _get(db, assessment_id)
+    if a.status != "RUNNING":
+        raise HTTPException(409, "Only a running analysis can be stopped.")
+    stop.request(a.id)
+    log_event(db, "assessment_stop_requested", assessment_id=a.id, actor="analyst", details={"stage": a.stage})
+    db.commit()
+    return _status(a)
+
+
 @router.post("/{assessment_id}/rerun", response_model=AssessmentOut, status_code=202)
 def rerun(assessment_id: int, background: BackgroundTasks, db: Session = Depends(get_db)) -> AssessmentOut:
     """Run a new analysis for a saved assessment (the UI asks for confirmation first). Creates a new
@@ -253,10 +267,21 @@ def _status(a: Assessment) -> StatusOut:
             state = "pending"
         stages.append(StageOut(index=i, label=label, state=state))
     return StatusOut(id=a.id, company_name=a.company.name, year=a.year, status=a.status, stage=current,
-                     stage_label=PUBLIC_STAGES[current - 1] if current else "Starting analysis",
+                     stage_label=_stage_label(a, current),
                      progress=a.progress, error=public_error(a.error), notices=assessment_out(a).notices, stages=stages,
                      started_at=a.started_at, completed_at=a.completed_at, duration_seconds=a.duration_seconds,
                      server_time=utcnow())
+
+
+def _stage_label(a: Assessment, current: int) -> str:
+    """The public stage, plus which questionnaire question is being answered (the longest stage)."""
+    if not current:
+        return "Starting analysis"
+    if a.status == "RUNNING" and stop.requested(a.id):
+        return "Stopping the analysis"
+    label = PUBLIC_STAGES[current - 1]
+    m = re.match(r"Answering question (\d+ of \d+)", a.stage_message or "")
+    return f"{label} (question {m.group(1)})" if m and a.status == "RUNNING" else label
 
 
 @router.get("/{assessment_id}/status", response_model=StatusOut)

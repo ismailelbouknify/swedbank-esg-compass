@@ -1,18 +1,12 @@
 import type { Recommendation } from "../api";
+import { noLevelLabel } from "../format";
 import { STATE, StateIcon } from "./ReviewStateBadge";
-
-const NO_EVIDENCE_TIP = "No evidence found in reviewed sources";
-const INSUFFICIENT_TIP = "Insufficient source coverage";
-const WITHHELD_TIP = "Insufficient evidence to recommend an assessment level";
 
 /** One score: the level (or — when nothing was found) plus a single review-state symbol. */
 export default function AssessmentCell({ r, onOpen }: { r?: Recommendation; onOpen: (id: number) => void }) {
   if (!r) return <span className="cell-empty">—</span>;
-  const changed = r.final_level !== null && r.final_level !== r.recommended_level;
-  const insufficient = r.evidence_status === "INSUFFICIENT_SOURCE_COVERAGE";
-  const noLevel = r.recommended_level < 1 && !changed; // nothing recommended: never shown as a score
-  const showDash = noLevel || r.review_state === "no_evidence" || ((r.evidence_status === "NO_EVIDENCE_FOUND" || insufficient) && !changed);
-  const gapTip = insufficient ? INSUFFICIENT_TIP : r.evidence_status === "REQUIRES_REVIEW" ? WITHHELD_TIP : NO_EVIDENCE_TIP;
+  const gapTip = noLevelLabel(r); // no score recommended: say why, never show a level
+  const showDash = gapTip !== null;
   const level = r.final_level ?? r.recommended_level;
   const label = `${r.factor_label}, ${r.dimension_label}: ${showDash ? gapTip : `level ${level} of ${r.max_level}`}. ${STATE[r.review_state].label}.`;
   return (

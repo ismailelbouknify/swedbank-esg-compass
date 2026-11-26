@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, type StatusResponse } from "../api";
 import { useDocumentTitle } from "../brand";
+import ConfirmDialog from "../components/ConfirmDialog";
 import { formatDuration } from "../format";
 
 const POLL_MS = 1500;
@@ -31,6 +32,8 @@ export default function AnalysisProgress() {
   const [st, setSt] = useState<StatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pollKey, setPollKey] = useState(0);
+  const [confirmStop, setConfirmStop] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const offset = useRef(0);
   const elapsed = useElapsed(st, offset.current);
   useDocumentTitle(st ? (st.status === "COMPLETED" ? `${st.company_name}` : `Analysing ${st.company_name}`) : null);
@@ -57,8 +60,21 @@ export default function AnalysisProgress() {
     };
   }, [aid, navigate, pollKey]);
 
+  async function stopAnalysis() {
+    setStopping(true);
+    try {
+      setSt(await api.stop(aid)); // polling continues until the analysis has stopped
+    } catch (e) {
+      setStopping(false);
+      setError((e as Error).message);
+    } finally {
+      setConfirmStop(false);
+    }
+  }
+
   async function start() {
     setError(null);
+    setStopping(false);
     try {
       setSt(await api.run(aid));
       setPollKey((k) => k + 1);
@@ -90,6 +106,9 @@ export default function AnalysisProgress() {
                  aria-valuenow={Math.round(st.progress)} aria-valuemin={0} aria-valuemax={100}>
               <div style={{ width: `${Math.max(3, st.progress)}%` }} />
             </div>
+            <button type="button" className="btn" disabled={stopping} onClick={() => setConfirmStop(true)}>
+              {stopping ? "Stopping…" : "Stop analysis"}
+            </button>
           </>
         )}
 
@@ -115,7 +134,9 @@ export default function AnalysisProgress() {
         {st.status === "FAILED" && (
           <div className="notice error" role="alert">
             <p>{st.error ?? "The analysis could not be completed."}</p>
-            <button type="button" className="btn primary" onClick={start}>Try again</button>
+            <button type="button" className="btn primary" onClick={start}>
+              {st.error === "Analysis stopped by the user." ? "Start again" : "Try again"}
+            </button>
           </div>
         )}
 
@@ -127,6 +148,13 @@ export default function AnalysisProgress() {
           <ul className="notice plain-list">{st.notices.map((n, i) => <li key={i}>{n}</li>)}</ul>
         )}
       </div>
+      {confirmStop && (
+        <ConfirmDialog title="Stop the analysis?" confirmLabel="Stop analysis" danger busy={stopping}
+                       onConfirm={stopAnalysis} onCancel={() => setConfirmStop(false)}>
+          <p>The analysis stops within moments. No recommendations are saved; sources already read are kept, and you can
+            start the analysis again later.</p>
+        </ConfirmDialog>
+      )}
     </div>
   );
 }

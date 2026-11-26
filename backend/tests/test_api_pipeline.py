@@ -93,7 +93,7 @@ def test_full_pipeline_without_model_recommends_nothing(client, sample_pdf):
     assert all(r["recommended_level"] == 0 and r["evidence_ids"] == [] for r in m.values()), "no level without evidence"
     assert all(r["evidence_status"] in ("REQUIRES_REVIEW", "NO_EVIDENCE_FOUND", "INSUFFICIENT_SOURCE_COVERAGE") for r in m.values())
     planning = m[("energy_management", "planning")]
-    assert planning["evidence_status"] == "REQUIRES_REVIEW" and planning["reason"].startswith("Insufficient evidence to recommend")
+    assert planning["evidence_status"] == "REQUIRES_REVIEW" and planning["reason"].startswith("Not analysed.")
     # nothing to approve; an analyst may still set a level with a reason
     rid = planning["id"]
     assert client.post(f"/api/recommendations/{rid}/review", json={"action": "APPROVE"}).status_code == 422

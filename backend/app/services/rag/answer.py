@@ -49,6 +49,7 @@ class Answerer:
         self.call_budget = call_budget  # None: no ceiling
         self.calls = 0
         self.seconds = 0.0
+        self.call_log: list[dict] = []  # performance diagnostics, one entry per model call
 
     def _budget_left(self) -> bool:
         return self.call_budget is None or self.calls < self.call_budget
@@ -74,9 +75,13 @@ class Answerer:
                 if not self._budget_left():
                     result.outcome = BUDGET
                     break
+                call_started = time.perf_counter()
                 raw = self._call(q, passages, correction)
                 v = verify_answer(raw, max_level=q.max_level, passages=passages, accepted_source_ids=accepted_source_ids,
                                   names_company=self.names_company)
+                self.call_log.append({"question": f"{q.factor}:{q.dimension}", "attempt": attempt, "passages": len(passages),
+                                      "seconds": round(time.perf_counter() - call_started, 2), "verified": v.ok,
+                                      "codes": v.codes, **getattr(self.llm, "last_call", {})})
                 if v.ok:
                     break
                 log.info("rag_verification_failed: question=%s:%s attempt=%d codes=%s", q.factor, q.dimension, attempt, v.codes)

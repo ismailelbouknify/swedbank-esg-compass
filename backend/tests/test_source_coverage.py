@@ -573,7 +573,7 @@ def test_third_party_author_does_not_inherit_identity(client, web, monkeypatch):
     assert sources[0].status == "PROCESSED" and sources[0].source_type == "other_web"
     rec = recs[("energy_management", "planning")]
     # "we" on a news site is its author: the quotation does not name the company, so no level is recommended
-    assert rec.recommended_level == 0 and rec.evidence_status == "REQUIRES_REVIEW"
+    assert rec.recommended_level == 0 and rec.evidence_status == "EVIDENCE_NOT_VERIFIED"
     cited = [e for e in evidence if e.id in rec.evidence_ids]
     assert all(e.verification_status == "REJECTED" and "company_not_named" in e.rejection_codes for e in cited)
 

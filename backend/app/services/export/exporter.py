@@ -13,7 +13,8 @@ from sqlalchemy.orm import Session
 from app.config.loader import dimension_config, factor_label, source_priority
 from app.models.entities import AnalystDecision, Assessment, Evidence, Recommendation, Source
 from app.services.presentation import (
-    PRODUCT_NAME, PRODUCT_SUBTITLE, REVIEW_STATE_LABEL, SOURCE_STATUS_LABEL, analyst_notices, review_state,
+    GAP_STATUSES, NO_LEVEL_LABEL, PRODUCT_NAME, PRODUCT_SUBTITLE, REVIEW_STATE_LABEL, SOURCE_STATUS_LABEL, analyst_notices,
+    review_state,
 )
 
 
@@ -70,8 +71,8 @@ def build_export(db: Session, a: Assessment) -> dict[str, Any]:
         return "Reporting" if r.dimension == "reporting" else f"{factor_label(r.factor)} - {dim}"
 
     def state(r: Recommendation) -> str:
-        if r.evidence_status == "INSUFFICIENT_SOURCE_COVERAGE" and r.review_status == "PENDING":
-            return "Insufficient source coverage"
+        if r.review_status == "PENDING" and r.recommended_level < 1 and r.evidence_status in NO_LEVEL_LABEL:
+            return NO_LEVEL_LABEL[r.evidence_status]  # no level recommended: say why
         return REVIEW_STATE_LABEL[review_state(r.review_status, r.evidence_status)]
 
     def level(value: int | None) -> int | None:
@@ -124,7 +125,7 @@ def build_export(db: Session, a: Assessment) -> dict[str, Any]:
         ],
         "data_gaps": [
             {"question": question(r), "finding": r.reason, "review_status": state(r)}
-            for r in recs if r.evidence_status in ("NO_EVIDENCE_FOUND", "INSUFFICIENT_SOURCE_COVERAGE")
+            for r in recs if r.evidence_status in GAP_STATUSES
         ],
         "sources": [
             {

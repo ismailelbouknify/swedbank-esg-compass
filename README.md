@@ -49,11 +49,17 @@ whose quotations cannot be verified is withheld. Nothing is ever converted into 
    levels are kept and shown separately. Everything is in an audit trail.
 9. **Export**: JSON, CSV, Excel (Assessment / Evidence / Data Gaps / Sources / Analyst Decisions sheets).
 
-Each answer is one of: a level with verified quotations (`EVIDENCE_FOUND`); `NO_EVIDENCE_FOUND` (adequate company
-sources were reviewed and nothing supported a level); `INSUFFICIENT_SOURCE_COVERAGE` (the sources were missing,
-inaccessible or inadequate); or `REQUIRES_REVIEW` (an answer was withheld because it could not be verified or the
-model could not run). The last three record no level ("Insufficient evidence to recommend an assessment level.");
-a Level 1 is only ever recommended when quoted evidence supports it.
+Each answer is shown in one of these ways, and every one stays pending analyst review:
+
+| Outcome | Status | Shown to the analyst |
+|---|---|---|
+| A level with quotations verified against the source text | `FOUND` | the AI-recommended level, the explanation and the quotations with source and page |
+| The model found no support, and adequate company sources were reviewed | `NO_EVIDENCE_FOUND` | "No supporting evidence found" (no score) |
+| The answer's quotations or references could not be verified (after one corrective retry) | `EVIDENCE_NOT_VERIFIED` | "Evidence could not be verified" (no score; the unverified suggestion is shown, marked as such) |
+| Relevant sources were missing, inaccessible or inadequate | `INSUFFICIENT_SOURCE_COVERAGE` | "Insufficient source coverage" (no score; upload the report) |
+| The model could not run, or the call ceiling was reached | `REQUIRES_REVIEW` | "Not analysed" (no score) |
+
+No level is ever assigned for missing evidence; Level 1 is only recommended when quoted evidence supports it.
 
 The methodology (questions, level definitions, scales) follows the ESG-76398 questionnaire and lives, unchanged, in
 `backend/app/config/esg_rules.json`. The model applies it; Python does not.

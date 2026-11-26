@@ -66,6 +66,18 @@ def analyst_notes(notes: list[str] | None) -> list[str]:
     return [n for n in (notes or []) if not is_technical(n)]
 
 
+# What is shown instead of a score when no level is recommended (evidence_status -> label). One source for the
+# analyst UI's wording (frontend/src/format.ts mirrors it) and the exports.
+EVIDENCE_NOT_VERIFIED = "EVIDENCE_NOT_VERIFIED"  # the answer's quotations could not be found in the cited source text
+NO_LEVEL_LABEL = {
+    "NO_EVIDENCE_FOUND": "No supporting evidence found",
+    EVIDENCE_NOT_VERIFIED: "Evidence could not be verified",
+    "INSUFFICIENT_SOURCE_COVERAGE": "Insufficient source coverage",
+    "REQUIRES_REVIEW": "Not analysed",
+}
+GAP_STATUSES = ("NO_EVIDENCE_FOUND", EVIDENCE_NOT_VERIFIED, "INSUFFICIENT_SOURCE_COVERAGE")
+
+
 def review_state(review_status: str, evidence_status: str) -> str:
     """The only three (plus 'changed') states the UI uses."""
     if review_status == "APPROVED":

@@ -3,14 +3,13 @@ import { Link, useParams } from "react-router-dom";
 import { api, type AssessmentSummary, type Questionnaire, type RecommendationDetail, type Source } from "../api";
 import { LOGO_SRC, PRODUCT_NAME, PRODUCT_SUBTITLE, useDocumentTitle, useLogoAvailable } from "../brand";
 import { STATE } from "../components/ReviewStateBadge";
-import { formatDate, formatDateTime } from "../format";
+import { formatDate, formatDateTime, isDataGap, noLevelLabel } from "../format";
 
 const DIMS = ["planning", "execution", "performance"] as const;
 
 function levelText(r: RecommendationDetail | undefined): string {
   if (!r) return "—";
-  const changed = r.final_level !== null && r.final_level !== r.recommended_level;
-  if ((r.recommended_level < 1 || r.evidence_status === "NO_EVIDENCE_FOUND" || r.evidence_status === "INSUFFICIENT_SOURCE_COVERAGE") && !changed) return "—";
+  if (noLevelLabel(r)) return "—";
   return `${r.final_level ?? r.recommended_level} / ${r.max_level}`;
 }
 
@@ -48,7 +47,7 @@ export default function AssessmentReport() {
   const byKey = new Map(details.map((r) => [`${r.factor}:${r.dimension}`, r]));
   const reporting = byKey.get("reporting:reporting");
   const withEvidence = details.filter((r) => r.evidence.length > 0);
-  const gaps = details.filter((r) => r.evidence_status === "NO_EVIDENCE_FOUND" || r.evidence_status === "INSUFFICIENT_SOURCE_COVERAGE");
+  const gaps = details.filter(isDataGap);
   const decisions = details.flatMap((r) => r.decisions.map((d) => ({ r, d }))).sort((x, y) => x.d.id - y.d.id);
   const processed = sources.filter((s) => s.status === "PROCESSED");
 
@@ -110,7 +109,7 @@ export default function AssessmentReport() {
                   return (
                     <td key={d}>
                       {levelText(r)}
-                      {r && <span className="report-state">{r.evidence_status === "INSUFFICIENT_SOURCE_COVERAGE" ? "Insufficient source coverage" : r.review_state === "no_evidence" ? "No evidence" : `${STATE[r.review_state].icon} ${STATE[r.review_state].label}`}</span>}
+                      {r && <span className="report-state">{noLevelLabel(r) ?? `${STATE[r.review_state].icon} ${STATE[r.review_state].label}`}</span>}
                     </td>
                   );
                 })}

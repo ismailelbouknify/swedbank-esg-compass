@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
 LLM_NOT_CONFIGURED_MESSAGE = (
@@ -26,6 +27,9 @@ class LLMStatus:
 
 class LLMProvider(ABC):
     provider_name: str = "base"
+    # Set by the runner while it answers questions: a provider that streams tokens checks it and stops generating
+    # (raising LLMUnavailableError) when the analyst stops the analysis. None: never stopped.
+    abort_check: Callable[[], bool] | None = None
 
     @property
     @abstractmethod

@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.config.loader import dimension_config, factor_label, source_priority
 from app.models.entities import AnalystDecision, Assessment, Evidence, Recommendation, Source
 from app.schemas.api import AssessmentListItem, AssessmentOut, EvidenceAuditOut, EvidenceOut, RecommendationOut, SourceOut
-from app.services.presentation import SOURCE_STATUS_LABEL, analyst_notes, analyst_notices, is_technical, review_state
+from app.services.presentation import GAP_STATUSES, SOURCE_STATUS_LABEL, analyst_notes, analyst_notices, is_technical, review_state
 
 
 def public_error(error: str | None) -> str | None:
@@ -40,7 +40,7 @@ def review_counts(db: Session, assessment_ids: list[int]) -> dict[int, tuple[int
         c = counts[aid]
         c[1] += 1
         c[0] += rs in ("APPROVED", "OVERRIDDEN")
-        c[2] += es in ("NO_EVIDENCE_FOUND", "INSUFFICIENT_SOURCE_COVERAGE")
+        c[2] += es in GAP_STATUSES
     return {k: (v[0], v[1], v[2]) for k, v in counts.items()}
 
 

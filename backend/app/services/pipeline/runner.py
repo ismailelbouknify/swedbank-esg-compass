@@ -39,7 +39,9 @@ from app.services.pipeline.coverage import (
 from app.services.pipeline.discovery import WebAccessState, discover, recover_sources
 from app.services.pipeline.network_notices import network_audit_details, network_notices
 from app.services.pipeline.ingest import ingest_pdf
+from app.services.pipeline import stop
 from app.services.pipeline.source_gate import apply_source_identity, identity_for
+from app.services.presentation import EVIDENCE_NOT_VERIFIED, NO_LEVEL_LABEL
 from app.services.rag import answer as A
 from app.services.rag.answer import Answer, Answerer
 from app.services.rag.prompt import prompt_overhead_tokens
@@ -70,10 +72,9 @@ BUDGET_GAP_REASON = ("Insufficient source coverage \u2014 not every relevant pas
                      "processing limit, so no conclusion was drawn.")
 COVERAGE_LIMITED_MESSAGE = ("Some public sources could not be processed, so a gap in this assessment may reflect an "
                             "unavailable source rather than missing company activity.")
-INSUFFICIENT_EVIDENCE_TEXT = "Insufficient evidence to recommend an assessment level."
 NO_PASSAGE_TEXT = "No passage relevant to this question was found in the reviewed sources."
-UNVERIFIED_TEXT = ("The suggested answer could not be verified against the sources (its quotations or references did not "
-                   "check out), so no level is recommended. Please review this question.")
+UNVERIFIED_TEXT = ("The suggested answer's quotations could not be found in the cited source text, so no level is "
+                   "recommended. Please review this question.")
 MODEL_ERROR_TEXT = "The local analysis component could not answer this question, so no level is recommended."
 BUDGET_TEXT = ("This question was not analysed within the assessment's processing limit, so no level is recommended.")
 NO_LLM_TEXT = ("The local analysis component is not available on this computer, so no level can be recommended. "
@@ -126,7 +127,12 @@ class AssessmentRunner:
             self.stage_seconds[stage] = round(self.stage_seconds.get(stage, 0.0) + time.perf_counter() - started, 2)
 
     # ------------------------------------------------------------------ progress
+    def _check_stop(self) -> None:
+        if stop.requested(self.a.id):
+            raise stop.AnalysisStopped()
+
     def _stage(self, idx: int, message: str | None = None, progress: float | None = None) -> None:
+        self._check_stop()  # every stage change and discovery step is a point where the analysis can be stopped
         self.a.stage = idx + 1
         self.a.stage_message = message or STAGES[idx]
         self.a.progress = progress if progress is not None else STAGE_PROGRESS[idx]
@@ -138,6 +144,7 @@ class AssessmentRunner:
         if a.status != "RUNNING" or a.started_at is None:  # the /run endpoint already stamped the start time
             a.started_at = datetime.now(timezone.utc)
         a.status, a.error, a.completed_at, a.duration_seconds = "RUNNING", None, None, None
+        stop.clear(a.id)  # a retry starts afresh
         self._reset_previous_results()
         self.db.commit()
         try:
@@ -181,6 +188,18 @@ class AssessmentRunner:
                 log_event(self.db, "assessment_replaced", assessment_id=prev.id, entity_type="assessment", entity_id=prev.id,
                           details={"replaced_by": a.id})
             self.db.commit()
+        except stop.AnalysisStopped:
+            log.info("Assessment %s stopped on request", a.id)
+            try:
+                self.db.rollback()
+                a = self.db.get(Assessment, a.id)
+                a.status, a.error, a.warnings = "FAILED", stop.STOPPED_MESSAGE, self.warnings
+                a.stage_message = stop.STOPPED_MESSAGE
+                a.duration_seconds = _elapsed(a.started_at, datetime.now(timezone.utc))
+                log_event(self.db, "assessment_stopped", assessment_id=a.id, details={"stage": a.stage})
+                self.db.commit()
+            except Exception:  # noqa: BLE001
+                log.exception("Assessment %s: failed to persist the stopped status", a.id)
         except Exception as exc:  # noqa: BLE001
             log.exception("Assessment %s failed", a.id)
             error_msg = f"{type(exc).__name__}: {exc}"
@@ -388,6 +407,9 @@ class AssessmentRunner:
             "model_seconds": round(self.llm_seconds, 2),
             "passages_deduplicated": self.duplicate_passages,
             "model_call_ceiling": self.settings.max_llm_calls_per_assessment,
+            "model_runtime": getattr(self, "llm_runtime", {}),  # context size, threads, model loads
+            "model_retries": sum(1 for c in getattr(self, "call_log", []) if c.get("attempt") == 2),
+            "model_call_log": getattr(self, "call_log", []),  # per call: tokens, prompt/generation time, verdict
             "questions": len(self.questions),
             "answer_outcomes": dict(self.outcomes),
             "questions_answered": self.outcomes.get(A.VERIFIED, 0),
@@ -442,24 +464,40 @@ class AssessmentRunner:
         answerer = Answerer(self.llm, self.a.company.name, self.a.year, max_output_tokens=s.llm_max_output_tokens,
                             call_budget=s.max_llm_calls_per_assessment or None, names_company=identity_for(self.a).is_named_in)
         accepted = set(accepted_sources(self.a))
+        self.llm.abort_check = lambda: stop.requested(self.a.id)  # a running model call stops at its next token
+        try:
+            answers = self._answer_all(plans, answerer, accepted)
+        finally:
+            self.llm.abort_check = None
+        self.llm_calls, self.llm_seconds = answerer.calls, answerer.seconds
+        self.call_log = answerer.call_log
+        self.llm_runtime = dict(getattr(self.llm, "runtime", {}) or {})
+        return self._finish_answers(answers)
+
+    def _answer_all(self, plans, answerer: Answerer, accepted: set[int]) -> list[Answer]:
         answers: list[Answer] = []
         for n, q in enumerate(self.questions):
+            self._check_stop()
             passages, candidates = plans[q.key]
-            self.a.stage_message = f"Answering: {q.factor_label}" + ("" if q.factor == REPORTING_FACTOR else f" \u2014 {q.dimension_label}")
+            self.a.stage_message = (f"Answering question {n + 1} of {len(self.questions)}: {q.factor_label}"
+                                    + ("" if q.factor == REPORTING_FACTOR else f" \u2014 {q.dimension_label}"))
             self.a.progress = STAGE_PROGRESS[4] + (STAGE_PROGRESS[5] - STAGE_PROGRESS[4]) * n / len(self.questions)
             self.db.commit()
             if passages and not self.llm_available:
                 answers.append(Answer(q, A.MODEL_ERROR, passages, errors=["model not available"], candidates=candidates))
                 continue
             answers.append(answerer.answer(q, passages, accepted, candidates))
-        self.llm_calls, self.llm_seconds = answerer.calls, answerer.seconds
+        self._check_stop()  # the last call may have been interrupted by the stop request
+        return answers
+
+    def _finish_answers(self, answers: list[Answer]) -> list[Answer]:
         self.a.extraction_mode = "llm" if self.llm_available else "none"
         for ans in answers:
             self.outcomes[ans.outcome] = self.outcomes.get(ans.outcome, 0) + 1
         log.info("rag_answering: questions=%d llm_calls=%d llm_seconds=%.1f outcomes=%s",
-                 len(answers), answerer.calls, answerer.seconds, self.outcomes)
+                 len(answers), self.llm_calls, self.llm_seconds, self.outcomes)
         log_event(self.db, "questions_answered", assessment_id=self.a.id,
-                  details={"llm_calls": answerer.calls, "llm_seconds": round(answerer.seconds, 1), "outcomes": self.outcomes})
+                  details={"llm_calls": self.llm_calls, "llm_seconds": round(self.llm_seconds, 1), "outcomes": self.outcomes})
         self.db.commit()
         return answers
 
@@ -510,12 +548,13 @@ class AssessmentRunner:
                               "Insufficient source coverage \u2014 the system could not access enough reliable company information.")
                     next_missing = ["Upload the company's sustainability or annual report to continue the assessment."]
                 else:
-                    reason = INSUFFICIENT_EVIDENCE_TEXT + " " + (NO_PASSAGE_TEXT if ans.outcome == A.NO_PASSAGES or not ans.explanation
-                                                                 else ans.explanation)
+                    reason = NO_LEVEL_LABEL[coverage] + ". " + (NO_PASSAGE_TEXT if ans.outcome == A.NO_PASSAGES or not ans.explanation
+                                                                else ans.explanation)
                 check_state = ("unknown", "No level was recommended, so there was nothing to verify.")
             else:
-                level, status, coverage = NOT_ASSESSED_LEVEL, "REQUIRES_REVIEW", None
-                reason = INSUFFICIENT_EVIDENCE_TEXT + " " + {
+                level, coverage = NOT_ASSESSED_LEVEL, None
+                status = EVIDENCE_NOT_VERIFIED if ans.outcome == A.UNVERIFIED else "REQUIRES_REVIEW"
+                reason = NO_LEVEL_LABEL[status] + ". " + {
                     A.UNVERIFIED: UNVERIFIED_TEXT, A.BUDGET: BUDGET_TEXT,
                     A.MODEL_ERROR: NO_LLM_TEXT if not self.llm_available else MODEL_ERROR_TEXT}[ans.outcome]
                 if ans.outcome == A.UNVERIFIED:

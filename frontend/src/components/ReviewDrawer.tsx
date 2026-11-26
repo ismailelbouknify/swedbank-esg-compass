@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api, evidenceLink, type Evidence, type RecommendationDetail } from "../api";
-import { formatDateTime } from "../format";
+import { formatDateTime, noLevelLabel } from "../format";
 import ReviewStateBadge from "./ReviewStateBadge";
 
 const MARK = { met: "✓", not_found: "✗", unknown: "?" } as const;
@@ -102,9 +102,9 @@ export default function ReviewDrawer({ recId, onClose, onChanged, onNext }: {
     }
   }
 
-  const insufficient = rec?.evidence_status === "INSUFFICIENT_SOURCE_COVERAGE";
-  const withheld = !!rec && rec.recommended_level < 1 && !insufficient && rec.evidence_status !== "NO_EVIDENCE_FOUND";
-  const noEvidence = rec?.evidence_status === "NO_EVIDENCE_FOUND" || insufficient || withheld;
+  const missing = rec ? noLevelLabel(rec) : null; // why no score is shown, if none is
+  const withheld = rec?.evidence_status === "EVIDENCE_NOT_VERIFIED";
+  const noEvidence = missing !== null;
   const evidence = rec?.evidence ?? [];
   const changed = rec && rec.final_level !== null && rec.final_level !== rec.recommended_level;
   const verification = rec?.conditions?.evidence_verification;
@@ -127,10 +127,9 @@ export default function ReviewDrawer({ recId, onClose, onChanged, onNext }: {
         {rec && (
           <div className="drawer-body">
             <div className="drawer-score">
-              {noEvidence && !changed ? (
+              {noEvidence ? (
                 <div className="score-line">
-                  <span className="score-big">—</span>{" "}
-                  <span className="muted">{insufficient ? "Insufficient source coverage" : "Insufficient evidence to recommend an assessment level."}</span>
+                  <span className="score-big">—</span> <span className="muted">{missing}</span>
                 </div>
               ) : (
                 <div className="score-line">
@@ -141,7 +140,7 @@ export default function ReviewDrawer({ recId, onClose, onChanged, onNext }: {
                   {changed && <> <span className="muted">{rec.recommended_level >= 1 ? "→ " : ""}Analyst-approved:</span> <span className="score-big">{rec.final_level} / {rec.max_level}</span></>}
                 </div>
               )}
-              {rec.level_description && !(noEvidence && !changed) && <p className="level-description">{rec.level_description}</p>}
+              {rec.level_description && !noEvidence && <p className="level-description">{rec.level_description}</p>}
               <ReviewStateBadge state={rec.review_state} />
             </div>
 

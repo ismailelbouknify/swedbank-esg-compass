@@ -459,7 +459,7 @@ def test_missing_evidence_is_no_evidence_found_with_adequate_sources(client, sam
     recs, _ = _recs(aid)
     gap = recs[("data_security", "performance")]  # the report has no data-security performance figures
     assert gap.coverage_state == "NO_EVIDENCE_FOUND" and gap.recommended_level == 0 and gap.evidence_ids == []
-    assert gap.reason.startswith("Insufficient evidence to recommend an assessment level.")
+    assert gap.reason.startswith("No supporting evidence found.")
 
 
 def test_missing_evidence_with_thin_sources_is_insufficient_coverage(client, web, monkeypatch):
@@ -492,7 +492,8 @@ def test_unverified_answer_is_withheld_and_flagged_with_its_suggestion(client, s
     run_assessment(aid, llm=Inventing(), search=NullSearchProvider())
     recs, ev = _recs(aid)
     r = recs[("energy_management", "planning")]
-    assert r.recommended_level == 0 and r.evidence_status == "REQUIRES_REVIEW" and r.review_status == "PENDING"
+    assert r.recommended_level == 0 and r.evidence_status == "EVIDENCE_NOT_VERIFIED" and r.review_status == "PENDING"
+    assert r.reason.startswith("Evidence could not be verified.")
     assert r.confidence_breakdown["proposed_level"] == 6 and "quote_not_found" in r.confidence_breakdown["verification_codes"]
     assert "Suggested explanation (not verified)" in r.reason
     assert r.evidence_ids and all(ev[i].verification_status == "REJECTED" for i in r.evidence_ids)
@@ -588,3 +589,57 @@ def test_recommendation_api_shape_is_unchanged_for_the_frontend(client, sample_p
     assert recs and all(expected <= set(r) for r in recs)
     detail = client.get(f"/api/recommendations/{recs[1]['id']}").json()
     assert {"evidence", "level_definitions", "decisions", "sources_reviewed"} <= set(detail)
+
+
+# ---------------------------------------------------------------- what the analyst sees when no score is recommended
+def test_each_outcome_is_shown_with_its_own_label_and_never_as_level_1(client, sample_pdf):
+    """Verified answer -> score, explanation, evidence. No supporting evidence -> "No supporting evidence found".
+    Quotation not in the source -> "Evidence could not be verified". Sources unavailable -> "Insufficient source
+    coverage" (test_missing_evidence_with_thin_sources_is_insufficient_coverage). All stay pending analyst review."""
+    invented = rag_answer("EVIDENCE_FOUND", 6, "Benchmarked.", [("chunk_0", "We have an SBTi-approved 1.5C target for all sites.")])
+
+    class Mixed(FakeLLM):
+        def complete_json(self, system, user, schema=None, max_tokens=384):
+            if "ESG FACTOR: Energy Management" in user and "DIMENSION: Planning" in user:
+                return invented.replace("chunk_0", prompt_passages(user)[0][0])
+            return super().complete_json(system, user, schema, max_tokens)
+
+    aid = _assessment(client)
+    _upload(client, aid, sample_pdf)
+    run_assessment(aid, llm=Mixed(), search=NullSearchProvider())
+    recs = {(r["factor"], r["dimension"]): r for r in client.get(f"/api/assessments/{aid}/recommendations").json()}
+
+    verified = recs[("data_security", "planning")]
+    assert verified["recommended_level"] == 4 and verified["evidence_status"] == "FOUND" and verified["evidence_ids"]
+    assert verified["review_state"] == "review" and verified["review_status"] == "PENDING"  # still the analyst's call
+
+    no_support = recs[("data_security", "performance")]
+    assert no_support["recommended_level"] == 0 and no_support["evidence_status"] == "NO_EVIDENCE_FOUND"
+    assert no_support["reason"].startswith("No supporting evidence found.") and no_support["evidence_ids"] == []
+
+    not_verified = recs[("energy_management", "planning")]
+    assert not_verified["recommended_level"] == 0 and not_verified["evidence_status"] == "EVIDENCE_NOT_VERIFIED"
+    assert not_verified["reason"].startswith("Evidence could not be verified.") and not_verified["review_state"] == "review"
+
+    assert all(r["recommended_level"] != 1 or r["evidence_status"] == "FOUND" for r in recs.values())  # no automatic Level 1
+    summary = client.get(f"/api/assessments/{aid}").json()
+    assert summary["data_gaps"] == sum(r["evidence_status"] in ("NO_EVIDENCE_FOUND", "EVIDENCE_NOT_VERIFIED",
+                                                                "INSUFFICIENT_SOURCE_COVERAGE") for r in recs.values())
+    export = client.get(f"/api/assessments/{aid}/export", params={"format": "json"}).json()
+    by_question = {(r["factor"], r["dimension"]): r for r in export["recommendations"]}
+    assert by_question[("Energy Management", "Planning")]["review_status"] == "Evidence could not be verified"
+    assert by_question[("Data Security", "Performance Improvement")]["review_status"] == "No supporting evidence found"
+    assert by_question[("Energy Management", "Planning")]["ai_recommended_level"] is None
+    gaps = {g["question"] for g in export["data_gaps"]}
+    assert "Energy Management - Planning" in gaps and "Data Security - Performance Improvement" in gaps
+
+
+def test_frontend_and_backend_use_the_same_no_score_labels():
+    """The UI mirrors the backend labels (frontend/src/format.ts); the frontend's own check runs with `npm test`."""
+    from pathlib import Path
+
+    from app.services.presentation import NO_LEVEL_LABEL
+
+    ts = (Path(__file__).resolve().parents[2] / "frontend/src/format.ts").read_text(encoding="utf-8")
+    for status, label in NO_LEVEL_LABEL.items():
+        assert f'{status}: "{label}"' in ts

@@ -1,7 +1,7 @@
 // Typed client for the FastAPI backend (see backend/app/schemas/api.py).
 // Only analyst-facing fields are typed here; technical metadata stays in the backend.
 
-export type EvidenceStatus = "FOUND" | "NO_EVIDENCE_FOUND" | "CONFLICTING_EVIDENCE" | "REQUIRES_REVIEW" | "INSUFFICIENT_SOURCE_COVERAGE";
+export type EvidenceStatus = "FOUND" | "NO_EVIDENCE_FOUND" | "EVIDENCE_NOT_VERIFIED" | "CONFLICTING_EVIDENCE" | "REQUIRES_REVIEW" | "INSUFFICIENT_SOURCE_COVERAGE";
 export type ReviewStatus = "PENDING" | "APPROVED" | "OVERRIDDEN";
 export type ReviewState = "review" | "approved" | "changed" | "no_evidence";
 export type AssessmentStatus = "CREATED" | "RUNNING" | "COMPLETED" | "FAILED";
@@ -245,6 +245,7 @@ export const api = {
     return request<Source>(`/api/assessments/${id}/documents`, { method: "POST", body: form });
   },
   run: (id: number) => request<StatusResponse>(`/api/assessments/${id}/run`, post()),
+  stop: (id: number) => request<StatusResponse>(`/api/assessments/${id}/stop`, post()),
   rerun: (id: number) => request<Assessment>(`/api/assessments/${id}/rerun`, post()),
   deleteAssessment: (id: number) => request<void>(`/api/assessments/${id}`, { method: "DELETE" }),
   status: (id: number) => request<StatusResponse>(`/api/assessments/${id}/status`),
